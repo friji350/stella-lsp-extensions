@@ -1,6 +1,5 @@
-import { type Module, inject } from "langium";
+import { Module, createDefaultCoreModule, inject } from "langium";
 import {
-  createDefaultModule,
   createDefaultSharedModule,
   type DefaultSharedModuleContext,
   type LangiumServices,
@@ -21,6 +20,15 @@ import { StellaScopeProvider } from "./references/scope-provider.js";
 import { StellaScopeComputation } from "./references/scope-computation.js";
 import { HoverProvider } from "./lsp/hover-provider.js";
 import { StellaCodeActionProvider } from "./lsp/code-action-provider.js";
+import {
+  createTypirLangiumServices,
+  initializeLangiumTypirServices,
+} from "typir-langium";
+import {
+  StellaTypeSystem,
+  type TypirStellaServices,
+} from "./type-system/stella-type-checker.js";
+import { reflection } from "./generated/ast.js";
 
 /**
  * Declaration of custom services - add your own service classes here.
@@ -29,6 +37,7 @@ export type StellaAddedServices = {
   validation: {
     StellaValidator: StellaValidator;
   };
+  typir: TypirStellaServices;
 };
 
 /**
@@ -42,24 +51,28 @@ export type StellaServices = LangiumServices & StellaAddedServices;
  * declared custom services. The Langium defaults can be partially specified to override only
  * selected services, while the custom services must be fully specified.
  */
-export const StellaModule: Module<
-  StellaServices,
-  PartialLangiumServices & StellaAddedServices
-> = {
-  validation: {
-    StellaValidator: () => new StellaValidator(),
-  },
-  lsp: {
-    SemanticTokenProvider: (services) => new SemanticTokenProvider(services),
-    CompletionProvider: (services) => new CompletionProvider(services),
-    HoverProvider: (services) => new HoverProvider(services),
-    CodeActionProvider: (services) => new StellaCodeActionProvider(services),
-  },
-  references: {
-    ScopeProvider: (services) => new StellaScopeProvider(services),
-    ScopeComputation: (services) => new StellaScopeComputation(services),
-  },
-};
+export function createStellaModule(
+  shared: LangiumSharedServices
+): Module<StellaServices, PartialLangiumServices & StellaAddedServices> {
+  return {
+    validation: {
+      StellaValidator: () => new StellaValidator(),
+    },
+    lsp: {
+      SemanticTokenProvider: (services) => new SemanticTokenProvider(services),
+      CompletionProvider: (services) => new CompletionProvider(services),
+      HoverProvider: (services) => new HoverProvider(services),
+      CodeActionProvider: (services) => new StellaCodeActionProvider(services),
+    },
+    // For type checking with Typir, inject and merge these modules:
+    typir: () =>
+      createTypirLangiumServices(shared, reflection, new StellaTypeSystem()),
+    references: {
+      ScopeProvider: (services) => new StellaScopeProvider(services),
+      ScopeComputation: (services) => new StellaScopeComputation(services),
+    },
+  };
+}
 
 /**
  * Create the full set of services required by Langium.
@@ -85,12 +98,13 @@ export function createStellaServices(context: DefaultSharedModuleContext): {
     StellaGeneratedSharedModule
   );
   const Stella = inject(
-    createDefaultModule({ shared }),
+    createDefaultCoreModule({ shared }),
     StellaGeneratedModule,
-    StellaModule
+    createStellaModule(shared)
   );
   shared.ServiceRegistry.register(Stella);
   registerValidationChecks(Stella);
+  initializeLangiumTypirServices(Stella, Stella.typir);
   if (!context.connection) {
     // We don't run inside a language server
     // Therefore, initialize the configuration provider instantly
