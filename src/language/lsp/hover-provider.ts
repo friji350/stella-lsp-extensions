@@ -26,11 +26,7 @@ export class HoverProvider extends AstNodeHoverProvider {
     const offset = document.textDocument.offsetAt(params.position);
     const cstNode = CstUtils.findLeafNodeAtOffset(root, offset);
 
-    if (!cstNode) {
-      return;
-    }
-
-    if (isExtension(cstNode.astNode) && isRecognizedExtension(cstNode.text)) {
+    if (cstNode && isExtension(cstNode.astNode) && isRecognizedExtension(cstNode.text)) {
       // Extension specifically needs the LeafCstNode at hover position (not provided to `getAstNodeHoverContent`)
       // TODO: open a PR to Langium to provide the HoverParams (or at least the position) to `getAstNodeHoverContent`
 
@@ -48,7 +44,26 @@ export class HoverProvider extends AstNodeHoverProvider {
       };
     }
 
-    return super.getHoverContent(document, params);
+    const baseHover = await super.getHoverContent(document, params);
+    if (baseHover) {
+      return baseHover;
+    }
+
+    if (cstNode?.astNode) {
+      const content = await this.getAstNodeHoverContent(cstNode.astNode);
+      if (content) {
+        return {
+          contents: {
+            kind: "markdown",
+            language: this.languageId,
+            value: content,
+          },
+          range: cstNode.range,
+        };
+      }
+    }
+
+    return undefined;
   }
 
   protected override getAstNodeHoverContent(
