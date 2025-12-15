@@ -4,7 +4,7 @@ import {
   InferenceRuleNotApplicable,
   isFunctionType,
 } from "typir";
-import type { Type as TypirType } from "typir";
+import type { Type as TypirType, TypirServices } from "typir";
 import type {
   LangiumTypeSystemDefinition,
   TypirLangiumServices,
@@ -29,9 +29,21 @@ import {
   TypeNat,
   TypeBool,
   ConstUnit,
+  Inl,
+  Inr,
+  Match,
+  MatchCase,
   // Let,
-  
-  // PatternVar,
+  PatternInl,
+  PatternInr, 
+  PatternVar,
+  TypeList,
+  List,
+  ConsList,
+  Head,
+  Tail,
+  IsEmpty,
+
   isPatternBinding,
 } from "../generated/ast.js";
 
@@ -75,6 +87,8 @@ export class StellaTypeSystem
 
     const tupleTypeCache = new Map<string, TypirType>();
     const tupleTypeLookup = new Map<TypirType, TypirType[]>();
+    const sumTypeCache = new Map<string, TypirType>();
+    const sumTypeLookup = new Map<TypirType, [TypirType, TypirType]>();
 
     const areTypesEqual = (left: TypirType, right: TypirType): boolean =>
       !typir.Equality.getTypeEqualityProblem(left, right);
@@ -104,6 +118,60 @@ export class StellaTypeSystem
       tupleTypeCache.set(key, tupleType);
       tupleTypeLookup.set(tupleType, componentTypes.slice());
       return tupleType;
+    };
+    const sumTypeKey = (left: TypirType, right: TypirType) =>
+      `${left.getIdentifier()}+${right.getIdentifier()}`;
+
+    const sumPrimitiveName = (left: TypirType, right: TypirType) =>
+      `Sum<${typir.Printer.printTypeName(left)}, ${typir.Printer.printTypeName(
+        right
+      )}>`;
+
+    const getOrCreateSumType = (
+      left: TypirType,
+      right: TypirType,
+      associatedLanguageNode?: AstNode
+    ): TypirType => {
+      const key = sumTypeKey(left, right);
+      const cached = sumTypeCache.get(key);
+      if (cached) {
+        return cached;
+      }
+
+      const sumType = typir.factory.Primitives.create({
+        primitiveName: `${sumPrimitiveName(left, right)}#${key}`,
+        associatedLanguageNode,
+      }).finish();
+      sumTypeCache.set(key, sumType);
+      sumTypeLookup.set(sumType, [left, right]);
+      return sumType;
+    };
+    const listTypeCache = new Map<string, TypirType>();
+    const listTypeLookup = new Map<TypirType, TypirType>();
+
+    const listTypeKey = (elementType: TypirType) =>
+      `${elementType.getIdentifier()}`;
+
+    const listPrimitiveName = (elementType: TypirType) =>
+      `List<${typir.Printer.printTypeName(elementType)}>`;
+
+    const getOrCreateListType = (
+      elementType: TypirType,
+      associatedLanguageNode?: AstNode
+    ): TypirType => {
+      const key = listTypeKey(elementType);
+      const cached = listTypeCache.get(key);
+      if (cached) {
+        return cached;
+      }
+
+      const listType = typir.factory.Primitives.create({
+        primitiveName: `${listPrimitiveName(elementType)}#${key}`,
+        associatedLanguageNode,
+      }).finish();
+      listTypeCache.set(key, listType);
+      listTypeLookup.set(listType, elementType);
+      return listType;
     };
     
     const functionTypeCache = new Map<string, TypirType>();
@@ -221,8 +289,7 @@ export class StellaTypeSystem
       inputArguments: (node) => [node.n],
     })
     .finish();
-
-    // TODO: "List::" functions (and the type itself) depend on Typir adding generics
+    // List primitives and operations are handled through cached element-specific types
 
     // Inference rules
     typir.Inference.addInferenceRulesForAstNodes({
@@ -320,6 +387,135 @@ export class StellaTypeSystem
       IsZero: () => {
         return typeBool ?? InferenceRuleNotApplicable;
       },
+      TypeSum: (node, typir) => {
+        const leftType = typir.Inference.inferType(node.left);
+        if (Array.isArray(leftType)) return InferenceRuleNotApplicable;
+        const rightType = typir.Inference.inferType(node.right);
+        if (Array.isArray(rightType)) return InferenceRuleNotApplicable;
+
+        return getOrCreateSumType(leftType, rightType, node);
+      },
+      TypeList: (node, typir) => {
+        const elementType = typir.Inference.inferType(node.type);
+        if (Array.isArray(elementType)) return InferenceRuleNotApplicable;
+        return getOrCreateListType(elementType, node);
+      },
+      List: (node, typir) => {
+        if (node.exprs.length === 0) {
+          const expected = getExpectedListType(node, typir, listTypeLookup);
+          if (!expected || Array.isArray(expected)) {
+            return InferenceRuleNotApplicable;
+          }
+          return expected;
+        }
+
+        const elementTypes: TypirType[] = [];
+        for (const expr of node.exprs) {
+          const exprType = typir.Inference.inferType(expr);
+          if (Array.isArray(exprType) || !exprType) {
+            return InferenceRuleNotApplicable;
+          }
+          elementTypes.push(exprType);
+        }
+
+        const reference = elementTypes[0];
+        for (const elementType of elementTypes.slice(1)) {
+          if (!areTypesEqual(reference, elementType)) {
+            return InferenceRuleNotApplicable;
+          }
+        }
+
+        return getOrCreateListType(reference, node);
+      },
+      ConsList: (node, typir) => {
+        const tailType = typir.Inference.inferType(node.tail);
+        if (Array.isArray(tailType) || !tailType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        const elementType = listTypeLookup.get(tailType);
+        if (!elementType) return InferenceRuleNotApplicable;
+
+        const headType = typir.Inference.inferType(node.head);
+        if (Array.isArray(headType) || !headType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        if (!areTypesEqual(headType, elementType)) {
+          return InferenceRuleNotApplicable;
+        }
+
+        return tailType;
+      },
+      Head: (node, typir) => {
+        const listType = typir.Inference.inferType(node.list);
+        if (Array.isArray(listType) || !listType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        const elementType = listTypeLookup.get(listType);
+        if (!elementType) return InferenceRuleNotApplicable;
+
+        return elementType;
+      },
+      Tail: (node, typir) => {
+        const listType = typir.Inference.inferType(node.list);
+        if (Array.isArray(listType) || !listType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        if (!listTypeLookup.has(listType)) return InferenceRuleNotApplicable;
+
+        return listType;
+      },
+      IsEmpty: (node, typir) => {
+        const listType = typir.Inference.inferType(node.list);
+        if (Array.isArray(listType) || !listType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        if (!listTypeLookup.has(listType)) return InferenceRuleNotApplicable;
+
+        return typeBool ?? InferenceRuleNotApplicable;
+      },
+      Inl: (node, typir) => {
+        const expectedSum = getExpectedSumType(node, typir, sumTypeLookup);
+        if (!expectedSum || Array.isArray(expectedSum)) {
+          return InferenceRuleNotApplicable;
+        }
+
+        return expectedSum;
+      },
+      Inr: (node, typir) => {
+        const expectedSum = getExpectedSumType(node, typir, sumTypeLookup);
+        if (!expectedSum || Array.isArray(expectedSum)) {
+          return InferenceRuleNotApplicable;
+        }
+
+        return expectedSum;
+      },
+      Match: (node, typir) => {
+        const branchTypes: TypirType[] = [];
+        for (const matchCase of node.cases) {
+          const exprType = typir.Inference.inferType(matchCase.expr);
+          if (Array.isArray(exprType)) return InferenceRuleNotApplicable;
+          if (!exprType) return InferenceRuleNotApplicable;
+          branchTypes.push(exprType);
+        }
+
+        if (branchTypes.length === 0) {
+          return InferenceRuleNotApplicable;
+        }
+
+        const first = branchTypes[0];
+        for (const branchType of branchTypes.slice(1)) {
+          if (!areTypesEqual(first, branchType)) {
+            return InferenceRuleNotApplicable;
+          }
+        }
+
+        return first;
+      },
       If: (node, typir) => {
         const cond = typir.Inference.inferType(node.condition);
         if (Array.isArray(cond) || cond !== typeBool) return InferenceRuleNotApplicable;
@@ -351,6 +547,15 @@ export class StellaTypeSystem
         const bodyType = typir.Inference.inferType(node.body);
         if (Array.isArray(bodyType)) return InferenceRuleNotApplicable;
         return bodyType;
+      },
+      TypeAsc: (node, typir) => {
+        const exprType = typir.Inference.inferType(node.expr);
+        if (Array.isArray(exprType)) return InferenceRuleNotApplicable;
+
+        const ascribedType = typir.Inference.inferType(node.type);
+        if (Array.isArray(ascribedType)) return InferenceRuleNotApplicable;
+
+        return ascribedType;
       },
       
     });
@@ -477,6 +682,16 @@ export class StellaTypeSystem
             languageNode: node,
           });
         }
+      },
+      TypeAsc: (node, accept, typir) => {
+        return typir.validation.Constraints.ensureNodeIsAssignable(
+          node.expr,
+          node.type,
+          accept,
+          (actual, expected) => ({
+            message: `An expression annotated with 'as' must have type ${expected.userRepresentation}, but it has type ${actual.userRepresentation}`,
+          })
+        );
       },
       Tuple: (node, accept) => {
         if (node.exprs.length !== 2) {
@@ -628,6 +843,241 @@ export class StellaTypeSystem
           });
         }
       },
+      List: (node, accept, typir) => {
+        if (node.exprs.length === 0) {
+          const expected = getExpectedListType(node, typir, listTypeLookup);
+          if (!expected) {
+            accept({
+              severity: "error",
+              message:
+                "Cannot infer the element type of an empty list. Add an annotation like '[] as [T]'.",
+              languageNode: node,
+            });
+          }
+          return;
+        }
+
+        const elementTypes: TypirType[] = [];
+        for (const expr of node.exprs) {
+          const exprType = typir.Inference.inferType(expr);
+          if (Array.isArray(exprType) || !exprType) {
+            return;
+          }
+          elementTypes.push(exprType);
+        }
+
+        const reference = elementTypes[0];
+        for (let i = 1; i < elementTypes.length; i++) {
+          const current = elementTypes[i];
+          if (!areTypesEqual(reference, current)) {
+            accept({
+              severity: "error",
+              message: `All list elements must have the same type. Expected ${reference.userRepresentation}, but element ${
+                i + 1
+              } has type ${current.userRepresentation}.`,
+              languageNode: node.exprs[i],
+            });
+          }
+        }
+      },
+      ConsList: (node, accept, typir) => {
+        const tailType = typir.Inference.inferType(node.tail);
+        if (Array.isArray(tailType) || !tailType) {
+          return;
+        }
+
+        const elementType = listTypeLookup.get(tailType);
+        if (!elementType) {
+          accept({
+            severity: "error",
+            message: "'cons' expects the tail to be a list.",
+            languageNode: node.tail,
+          });
+          return;
+        }
+
+        typir.validation.Constraints.ensureNodeIsAssignable(
+          node.head,
+          elementType,
+          accept,
+          (actual, expected) => ({
+            message: `'cons' head must have type ${expected.userRepresentation}, but has ${actual.userRepresentation}.`,
+          })
+        );
+      },
+      Head: (node, accept, typir) => {
+        const listType = typir.Inference.inferType(node.list);
+        if (Array.isArray(listType)) {
+          return;
+        }
+        const elementType = listType ? listTypeLookup.get(listType) : undefined;
+        if (!elementType) {
+          const actual = listType
+            ? typir.Printer.printTypeUserRepresentation(listType)
+            : "unknown";
+          accept({
+            severity: "error",
+            message: `'List::head' expects a list, but got ${actual}.`,
+            languageNode: node.list,
+          });
+        }
+      },
+      Tail: (node, accept, typir) => {
+        const listType = typir.Inference.inferType(node.list);
+        if (Array.isArray(listType)) {
+          return;
+        }
+        if (!listType || !listTypeLookup.has(listType)) {
+          const actual = listType
+            ? typir.Printer.printTypeUserRepresentation(listType)
+            : "unknown";
+          accept({
+            severity: "error",
+            message: `'List::tail' expects a list, but got ${actual}.`,
+            languageNode: node.list,
+          });
+        }
+      },
+      IsEmpty: (node, accept, typir) => {
+        const listType = typir.Inference.inferType(node.list);
+        if (Array.isArray(listType)) {
+          return;
+        }
+        if (!listType || !listTypeLookup.has(listType)) {
+          const actual = listType
+            ? typir.Printer.printTypeUserRepresentation(listType)
+            : "unknown";
+          accept({
+            severity: "error",
+            message: `'List::isempty' expects a list, but got ${actual}.`,
+            languageNode: node.list,
+          });
+        }
+      },
+      Inl: (node, accept, typir) => {
+        const expectedSum = getExpectedSumType(node, typir, sumTypeLookup);
+        if (!expectedSum || Array.isArray(expectedSum)) {
+          accept({
+            severity: "error",
+            message:
+              "It is not possible to output the amount type for 'inl'. Add an annotation of the form 'as <T + U>' or use it in the context of the expected type.",
+            languageNode: node,
+          });
+          return;
+        }
+
+        const components = sumTypeLookup.get(expectedSum);
+        if (!components) {
+          return;
+        }
+
+        const [left] = components;
+        typir.validation.Constraints.ensureNodeIsAssignable(
+          node.expr,
+          left,
+          accept,
+          (actual, expected) => ({
+            message: `'inl' expected ${expected.userRepresentation}, but get ${actual.userRepresentation}`,
+          })
+        );
+      },
+      Inr: (node, accept, typir) => {
+        const expectedSum = getExpectedSumType(node, typir, sumTypeLookup);
+        if (!expectedSum || Array.isArray(expectedSum)) {
+          accept({
+            severity: "error",
+            message:
+              "It is not possible to output the amount type for 'inr'. Add an annotation of the form 'as <T + U>' or use it in the context of the expected type.",
+            languageNode: node,
+          });
+          return;
+        }
+
+        const components = sumTypeLookup.get(expectedSum);
+        if (!components) {
+          return;
+        }
+
+        const [, right] = components;
+        typir.validation.Constraints.ensureNodeIsAssignable(
+          node.expr,
+          right,
+          accept,
+          (actual, expected) => ({
+            message: `'inr' expected ${expected.userRepresentation},but get ${actual.userRepresentation}`,
+          })
+        );
+      },
+      Match: (node, accept, typir) => {
+        const scrutineeType = typir.Inference.inferType(node.expr);
+        if (Array.isArray(scrutineeType) || !scrutineeType) {
+          accept({
+            severity: "error",
+            message:
+              "It is impossible to determine the type of the expression in 'match'. Add a type annotation or simplify the expression.",
+            languageNode: node.expr,
+          });
+          return;
+        }
+
+        const sumComponents = sumTypeLookup.get(scrutineeType);
+        if (!sumComponents) {
+          accept({
+            severity: "error",
+            message:
+              "The template matching with 'inl'/'inr' applies only to the summary type. Add '#sum-types' and specify the amount type.",
+            languageNode: node.expr,
+          });
+          return;
+        }
+
+        let inlSeen = false;
+        let inrSeen = false;
+
+        const branchTypes: TypirType[] = [];
+        for (const matchCase of node.cases) {
+          const coverage = validatePatternAgainstSum(
+            matchCase.pattern,
+            sumComponents,
+            accept,
+            typir
+          );
+          inlSeen ||= coverage.inl;
+          inrSeen ||= coverage.inr;
+
+          const caseType = typir.Inference.inferType(matchCase.expr);
+          if (Array.isArray(caseType) || !caseType) {
+            continue;
+          }
+          branchTypes.push(caseType);
+        }
+
+        if (branchTypes.length < node.cases.length) {
+          return;
+        }
+
+        const reference = branchTypes[0];
+        for (const branchType of branchTypes.slice(1)) {
+          if (!areTypesEqual(reference, branchType)) {
+            accept({
+              severity: "error",
+              message:
+                "All branches of the 'match' must return the same type.",
+              languageNode: node,
+            });
+            return;
+          }
+        }
+
+        if (!inlSeen || !inrSeen) {
+          accept({
+            severity: "error",
+            message:
+              "The total type should be split into both branches: 'inl' and 'inr' are expected.",
+            languageNode: node,
+          });
+        }
+      },
     });
   }
 
@@ -651,10 +1101,150 @@ export class StellaTypeSystem
         .inferenceRuleForCalls<Application>({
           languageKey: Application.$type,
           matching: (application) => {
-            return (application.fun as Var)?.ref?.ref === node; // TODO: check what any expression evaluates to
+            return (application.fun as Var)?.ref?.ref === node; 
           },
           inputArguments: (application) => application.args,
         });
     }
+  }
+}
+
+function getExpectedSumType(
+  node: Inl | Inr,
+  typir: TypirServices<StellaSpecifics>,
+  sumTypeLookup: Map<TypirType, [TypirType, TypirType]>
+): TypirType | undefined {
+  const container = node.$container as AstNode | undefined;
+  if (!container) return undefined;
+
+  // Ascription: (inl e) as T
+  if ((container as { $type?: string; expr?: unknown }).$type === "TypeAsc") {
+    const typeAsc = container as { type?: unknown; expr?: unknown };
+    if (typeAsc.expr === node && typeAsc.type) {
+      const expected = typir.Inference.inferType(typeAsc.type as AstNode);
+      if (!Array.isArray(expected) && sumTypeLookup.has(expected)) {
+        return expected;
+      }
+    }
+  }
+
+  // Function return position
+  if (isDeclFun(container) && container.returnExpr === node && container.returnType) {
+    const expected = typir.Inference.inferType(container.returnType);
+    if (!Array.isArray(expected) && sumTypeLookup.has(expected)) {
+      return expected;
+    }
+  }
+
+  // Match branch expression
+  if ((container as MatchCase).expr === node) {
+    const matchNode = (container as MatchCase).$container as Match | undefined;
+    if (matchNode) {
+      const scrutinee = typir.Inference.inferType(matchNode.expr);
+      if (!Array.isArray(scrutinee) && sumTypeLookup.has(scrutinee)) {
+        return scrutinee;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function getExpectedListType(
+  node: List,
+  typir: TypirServices<StellaSpecifics>,
+  listTypeLookup: Map<TypirType, TypirType>
+): TypirType | undefined {
+  const container = node.$container as AstNode | undefined;
+  if (!container) return undefined;
+
+  // Ascription: [] as [T]
+  if ((container as { $type?: string; expr?: unknown }).$type === "TypeAsc") {
+    const typeAsc = container as { type?: unknown; expr?: unknown };
+    if (typeAsc.expr === node && typeAsc.type) {
+      const expected = typir.Inference.inferType(typeAsc.type as AstNode);
+      if (!Array.isArray(expected) && listTypeLookup.has(expected)) {
+        return expected;
+      }
+    }
+  }
+
+  // Function return position
+  if (isDeclFun(container) && container.returnExpr === node && container.returnType) {
+    const expected = typir.Inference.inferType(container.returnType);
+    if (!Array.isArray(expected) && listTypeLookup.has(expected)) {
+      return expected;
+    }
+  }
+
+  // Match branch expression
+  if ((container as MatchCase).expr === node) {
+    const matchNode = (container as MatchCase).$container as Match | undefined;
+    if (matchNode) {
+      const scrutinee = typir.Inference.inferType(matchNode.expr);
+      if (!Array.isArray(scrutinee) && listTypeLookup.has(scrutinee)) {
+        return scrutinee;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function validatePatternAgainstSum(
+  pattern: PatternInl | PatternInr | PatternVar | AstNode,
+  sumComponents: [TypirType, TypirType],
+  accept: (diagnostic: {
+    severity: "error" | "warning";
+    message: string;
+    languageNode: AstNode;
+  }) => void,
+  typir: TypirServices<StellaSpecifics>
+): { inl: boolean; inr: boolean } {
+  switch ((pattern as AstNode).$type) {
+    case "PatternInl": {
+      const inner = (pattern as PatternInl).pattern;
+      if (inner.$type !== "PatternVar") {
+        const expected = sumComponents[0];
+        const innerType = typir.Inference.inferType(inner as AstNode);
+        if (innerType && !Array.isArray(innerType) && !typir.Equality.getTypeEqualityProblem(innerType, expected)) {
+      
+        } else if (innerType && !Array.isArray(innerType)) {
+          accept({
+            severity: "error",
+            message: `The 'inl' template expects a left-hand component of the type ${expected.getName()}.`,
+            languageNode: inner as AstNode,
+          });
+        }
+      }
+      return { inl: true, inr: false };
+    }
+    case "PatternInr": {
+      const inner = (pattern as PatternInr).pattern;
+      if (inner.$type !== "PatternVar") {
+        const expected = sumComponents[1];
+        const innerType = typir.Inference.inferType(inner as AstNode);
+        if (innerType && !Array.isArray(innerType) && !typir.Equality.getTypeEqualityProblem(innerType, expected)) {
+          // ok
+        } else if (innerType && !Array.isArray(innerType)) {
+          accept({
+            severity: "error",
+            message: `The 'inr' template expects a right-hand component of the type ${expected.getName()}.`,
+            languageNode: inner as AstNode,
+          });
+        }
+      }
+      return { inl: false, inr: true };
+    }
+    case "PatternVar":
+      return { inl: true, inr: true };
+    default:
+      accept({
+        severity: "error",
+        message:
+          "For the total type, the patterns 'inl', 'inr' or variable are acceptable.",
+        languageNode: pattern as AstNode,
+      });
+      return { inl: false, inr: false };
   }
 }
