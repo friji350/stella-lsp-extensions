@@ -19,9 +19,14 @@ import {
   type Program,
   type Record,
   type StellaAstType,
+  type TypeAsc,
 } from "./generated/ast.js";
 import type { StellaServices } from "./stella-module.js";
-import { extensionValues } from "./extensions.js";
+import {
+  extensionValues,
+  Extensions,
+  getExtensions,
+} from "./extensions.js";
 import { DiagnosticCodes } from "./validator/errors.js";
 import { levenshtein } from "../utils.js";
 
@@ -41,6 +46,7 @@ export function registerValidationChecks(services: StellaServices) {
     PatternCons: validator.checkModernPatternConsSyntax,
     Record: validator.checkDuplicateRecordFields,
     PatternRecord: validator.checkDuplicateRecordFields,
+    TypeAsc: validator.checkTypeAscriptionsEnabled,
   };
   registry.register(checks, validator);
 }
