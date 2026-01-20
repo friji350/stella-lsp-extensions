@@ -46,7 +46,7 @@ export function registerValidationChecks(services: StellaServices) {
     PatternCons: validator.checkModernPatternConsSyntax,
     Record: validator.checkDuplicateRecordFields,
     PatternRecord: validator.checkDuplicateRecordFields,
-    TypeAsc: validator.checkTypeAscriptionsEnabled,
+    //TypeAsc: validator.checkTypeAscriptionsEnabled,
   };
   registry.register(checks, validator);
 }
@@ -217,6 +217,27 @@ export class StellaValidator {
         location: { uri, range },
       },
     ];
+  }
+
+  checkTypeAscriptionsEnabled(
+    typeAsc: TypeAsc,
+    accept: ValidationAcceptor
+  ): void {
+    const program = typeAsc.$document?.parseResult?.value as Program | undefined;
+    if (!program) {
+      return;
+    }
+
+    if (!getExtensions(program).has(Extensions.TypeAscriptions)) {
+      accept(
+        "error",
+        "Type ascriptions require the '#type-ascriptions' extension",
+        {
+          node: typeAsc,
+          code: DiagnosticCodes.TYPE_ASCRIPTIONS_EXTENSION_REQUIRED,
+        }
+      );
+    }
   }
 
   // TODO: add all validations from https://github.com/fizruk/stella/blob/main/stella/src/Language/Stella/ExtensionCheck.hs
