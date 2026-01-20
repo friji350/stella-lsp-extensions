@@ -29,6 +29,7 @@ import {
   type TypirStellaServices,
 } from "./type-system/stella-type-checker.js";
 import { reflection } from "./generated/ast.js";
+import { StellaExtensionValidator, registerExtensionChecks } from "./validator/extensions-validator.js";
 
 /**
  * Declaration of custom services - add your own service classes here.
