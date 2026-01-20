@@ -10,9 +10,14 @@ import {
   type Extension,
   type Program,
   type StellaAstType,
+  type TypeAsc,
 } from "./generated/ast.js";
 import type { StellaServices } from "./stella-module.js";
-import { extensionValues } from "./extensions.js";
+import {
+  extensionValues,
+  Extensions,
+  getExtensions,
+} from "./extensions.js";
 import { DiagnosticCodes } from "./validator/errors.js";
 
 /**
@@ -29,6 +34,7 @@ export function registerValidationChecks(services: StellaServices) {
     ],
     Extension: validator.checkValidExtension,
     PatternCons: validator.checkModernPatternConsSyntax,
+    TypeAsc: validator.checkTypeAscriptionsEnabled,
   };
   registry.register(checks, validator);
 }
@@ -147,6 +153,27 @@ export class StellaValidator {
         {
           node: patternCons,
           code: DiagnosticCodes.LEGACY_PATTERN_CONS,
+        }
+      );
+    }
+  }
+
+  checkTypeAscriptionsEnabled(
+    typeAsc: TypeAsc,
+    accept: ValidationAcceptor
+  ): void {
+    const program = typeAsc.$document?.parseResult?.value as Program | undefined;
+    if (!program) {
+      return;
+    }
+
+    if (!getExtensions(program).has(Extensions.TypeAscriptions)) {
+      accept(
+        "error",
+        "Type ascriptions require the '#type-ascriptions' extension",
+        {
+          node: typeAsc,
+          code: DiagnosticCodes.TYPE_ASCRIPTIONS_EXTENSION_REQUIRED,
         }
       );
     }

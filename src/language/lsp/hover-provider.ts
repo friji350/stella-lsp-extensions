@@ -69,9 +69,14 @@ export class HoverProvider extends AstNodeHoverProvider {
   protected override getAstNodeHoverContent(
     node: AstNode
   ): MaybePromise<string | undefined> {
-    const type = this.typir.Inference.inferType(node);
-    if (isType(type)) {
-      return type.getName();
+    try {
+      const type = this.typir.Inference.inferType(node);
+      if (!Array.isArray(type) && isType(type)) {
+        return type.getName();
+      }
+    } catch {
+      // If type inference fails (e.g., due to recursive rules), don't crash hover
+      return undefined;
     }
 
     return undefined;

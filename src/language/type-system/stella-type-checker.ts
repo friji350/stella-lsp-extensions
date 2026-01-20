@@ -37,12 +37,12 @@ import {
   PatternInl,
   PatternInr, 
   PatternVar,
-  TypeList,
+  // TypeList,
   List,
-  ConsList,
-  Head,
-  Tail,
-  IsEmpty,
+  // ConsList,
+  // Head,
+  // Tail,
+  // IsEmpty,
 
   isPatternBinding,
 } from "../generated/ast.js";
@@ -872,9 +872,9 @@ export class StellaTypeSystem
           if (!areTypesEqual(reference, current)) {
             accept({
               severity: "error",
-              message: `All list elements must have the same type. Expected ${reference.userRepresentation}, but element ${
+              message: `All list elements must have the same type. Expected ${reference.getUserRepresentation}, but element ${
                 i + 1
-              } has type ${current.userRepresentation}.`,
+              } has type ${current.getUserRepresentation}.`,
               languageNode: node.exprs[i],
             });
           }
