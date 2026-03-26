@@ -180,13 +180,28 @@ export class StellaValidator {
     record: Record | PatternRecord,
     accept: ValidationAcceptor
   ): void {
-    const groups: Partial<
-      globalThis.Record<string, Array<Binding | LabelledPattern>>
-    > = isRecord(record)
-      ? Object.groupBy(record.bindings, (binding) => binding.name)
-      : Object.groupBy(record.patterns, (binding) => binding.label);
+    const groups = new Map<string, Array<Binding | LabelledPattern>>();
+    if (isRecord(record)) {
+      for (const item of record.bindings) {
+        const existing = groups.get(item.name);
+        if (existing) {
+          existing.push(item);
+        } else {
+          groups.set(item.name, [item]);
+        }
+      }
+    } else {
+      for (const item of record.patterns) {
+        const existing = groups.get(item.label);
+        if (existing) {
+          existing.push(item);
+        } else {
+          groups.set(item.label, [item]);
+        }
+      }
+    }
 
-    Object.values(groups).forEach((bindings) => {
+    [...groups.values()].forEach((bindings) => {
       bindings?.slice(1).forEach((binding) => {
         accept("error", "Duplicate field", {
           node: binding,

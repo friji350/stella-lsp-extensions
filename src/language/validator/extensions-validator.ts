@@ -789,6 +789,7 @@ export class StellaExtensionValidator {
   }
 
   checkTypeSum(node: TypeSum, accept: ValidationAcceptor): void {
+    if (node.$type !== "TypeSum") return;
     this.requireExtension("sum types", node, Extensions.SumTypes, accept);
   }
 
