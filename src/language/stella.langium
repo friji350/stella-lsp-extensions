@@ -74,7 +74,8 @@ ConstFalse:
 ConstUnit:
     {infer ConstUnit} 'unit';
 ConstInt:
-    n=INT;
+    {infer ConstInt} n=INT
+    | {infer ConstInt} '-' n=INT;
 ConstMemory:
     mem=MEMORY_ADDRESS;
 Var:
@@ -94,7 +95,7 @@ Inl:
 Inr:
     'inr' '(' expr=Expr ')';
 ConsList:
-    'cons' '(' head=Expr ',' tail=Expr ')';
+    ('cons' | 'List::cons') '(' head=Expr ',' tail=Expr ')';
 Head:
     'List::head' '(' list=Expr ')';
 IsEmpty:
@@ -136,7 +137,8 @@ Match:
 MatchCase:
     pattern=Pattern '=>' expr=Expr;
 List:
-    '[' (exprs+=Expr (',' exprs+=Expr)*)? ']';
+    '[' (exprs+=Expr (',' exprs+=Expr)*)? ']'
+    | 'List::nil';
 If:
     'if' condition=Expr 'then' thenExpr=Expr 'else' elseExpr=Expr;
 Let:
@@ -380,7 +382,8 @@ TypeVariant:
 VariantFieldType:
     label=ID (':' type=Type)?;
 TypeList:
-    '[' type=Type ']';
+    '[' type=Type ']'
+    | 'List' '[' type=Type ']';
 TypeUnit:
     {infer TypeUnit} 'Unit';
 TypeTop:
@@ -418,7 +421,7 @@ hidden terminal WS: /\s+/;
 terminal ID: /[_a-zA-Z][!\-:?\w]*/;
 terminal EXTENSION_NAME: /#[-\w]+/;
 terminal MEMORY_ADDRESS: /<0x[\da-fA-F]+>/;
-terminal INT returns number: /-?[0-9]+/;
+terminal INT returns number: /[0-9]+/;
 terminal STRING: /"(\\.|[^"\\])*"/;
 
 hidden terminal ML_COMMENT: /\/\*[\s\S]*?\*\//;

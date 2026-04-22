@@ -40,12 +40,13 @@ export function registerValidationChecks(services: StellaServices) {
     Program: [
       validator.checkUniqueExtensions,
       validator.checkHasMain,
+      validator.checkMainSignature,
+      validator.checkExceptionDeclarations,
       validator.checkUniqueFunctionNames,
     ],
     Extension: validator.checkValidExtension,
     PatternCons: validator.checkModernPatternConsSyntax,
     Record: validator.checkDuplicateRecordFields,
-    PatternRecord: validator.checkDuplicateRecordFields,
     //TypeAsc: validator.checkTypeAscriptionsEnabled,
   };
   registry.register(checks, validator);
@@ -62,6 +63,17 @@ export class StellaValidator {
         property: "langDecl", // To not highlight the whole program
         code: DiagnosticCodes.MISSING_MAIN,
       });
+    }
+  }
+
+  checkMainSignature(program: Program, accept: ValidationAcceptor): void {
+    for (const decl of program.decls) {
+      if (isDeclFun(decl) && decl.name === "main" && decl.paramDecls.length !== 1) {
+        accept("error", "Main function must have exactly one parameter", {
+          node: decl,
+          property: "name",
+        });
+      }
     }
   }
 
@@ -82,6 +94,51 @@ export class StellaValidator {
         } else {
           usedNames.set(decl.name, decl);
         }
+      }
+    }
+  }
+
+  checkExceptionDeclarations(program: Program, accept: ValidationAcceptor): void {
+    const exceptionTypes = program.decls.filter(
+      (decl) => decl.$type === "DeclExceptionType"
+    );
+    const exceptionVariants = program.decls.filter(
+      (decl) => decl.$type === "DeclExceptionVariant"
+    );
+
+    if (exceptionTypes.length > 1) {
+      for (const decl of exceptionTypes.slice(1)) {
+        accept("error", "Duplicate exception type declaration", {
+          node: decl,
+          code: "ERROR_DUPLICATE_EXCEPTION_TYPE",
+          relatedInformation: this.getPreviousDefinitionRelatedInfo(
+            exceptionTypes[0]
+          ),
+        });
+      }
+    }
+
+    if (exceptionTypes.length > 0 && exceptionVariants.length > 0) {
+      for (const decl of [...exceptionTypes, ...exceptionVariants]) {
+        accept("error", "Conflicting exception declarations", {
+          node: decl,
+          code: "ERROR_CONFLICTING_EXCEPTION_DECLARATIONS",
+        });
+      }
+    }
+
+    const seenVariantNames = new Map<string, AstNode>();
+    for (const decl of exceptionVariants) {
+      const name = (decl as unknown as { name: string }).name;
+      const previous = seenVariantNames.get(name);
+      if (previous) {
+        accept("error", `Duplicate exception variant '${name}'`, {
+          node: decl,
+          code: "ERROR_DUPLICATE_EXCEPTION_VARIANT",
+          relatedInformation: this.getPreviousDefinitionRelatedInfo(previous),
+        });
+      } else {
+        seenVariantNames.set(name, decl);
       }
     }
   }

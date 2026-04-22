@@ -291,7 +291,7 @@ export class StellaExtensionValidator {
     this.requireExtension(
       "exception variant declaration",
       node,
-      Extensions.ExceptionTypeDeclaration,
+      Extensions.OpenVariantExceptions,
       accept
     );
   }
@@ -438,7 +438,7 @@ export class StellaExtensionValidator {
         Extensions.NullaryVariantLabels,
         accept
       );
-    } else {
+    } else if (!isPatternVar(pattern.pattern)) {
       this.checkStructuralPatterns(pattern.pattern, accept);
     }
   }
@@ -495,8 +495,9 @@ export class StellaExtensionValidator {
   }
 
   checkConstInt(node: ConstInt, accept: ValidationAcceptor): void {
-    if (node.n === 0) return;
-    if (node.n > 0) {
+    const value = node.n ?? 0;
+    if (value === 0) return;
+    if (value > 0) {
       this.requireExtension(
         "natural numbers",
         node,
@@ -531,7 +532,6 @@ export class StellaExtensionValidator {
   }
 
   checkLetBindings(node: Let, accept: ValidationAcceptor): void {
-    this.requireExtension("let-bindings", node, Extensions.LetBindings, accept);
     if (node.patternBindings.length > 1) {
       this.requireExtension(
         "let-bindings with multiple bindings",
@@ -540,11 +540,11 @@ export class StellaExtensionValidator {
         accept
       );
     }
-    if (!node.patternBindings.every(isPatternVar)) {
+    if (!node.patternBindings.every((binding) => isPatternVar(binding.pattern))) {
       this.requireExtension(
         "let-bindings with patterns",
         node,
-        Extensions.LetPatterns,
+        [Extensions.LetPatterns, Extensions.StructuralPatterns],
         accept
       );
     }
@@ -565,11 +565,11 @@ export class StellaExtensionValidator {
         accept
       );
     }
-    if (!node.patternBindings.every(isPatternVar)) {
+    if (!node.patternBindings.every((binding) => isPatternVar(binding.pattern))) {
       this.requireExtension(
         "letrec-bindings with patterns",
         node,
-        Extensions.LetPatterns,
+        [Extensions.LetPatterns, Extensions.StructuralPatterns],
         accept
       );
     }
@@ -641,7 +641,8 @@ export class StellaExtensionValidator {
   }
 
   checkPred(node: Pred, accept: ValidationAcceptor): void {
-    this.requireExtension("predecessor", node, Extensions.Predecessor, accept);
+    void node;
+    void accept;
   }
 
   checkFix(node: Fix, accept: ValidationAcceptor): void {

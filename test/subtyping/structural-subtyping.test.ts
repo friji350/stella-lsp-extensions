@@ -85,6 +85,31 @@ describe("Structural subtyping", () => {
     expect(formatIssues(document)).toHaveLength(0);
   });
 
+  test("reports missing and mismatched record fields in function return types", async () => {
+    document = await parse(`
+      language core;
+
+      extend with #records, #structural-subtyping;
+
+      fn main(k : fn(Nat) -> Bool) -> { x : fn(Bool) -> Nat, y : Bool, f : Bool } {
+        return
+          { x = fn(x : Bool) {
+                  return if k(succ(0))
+                    then if x then 0 else succ(0)
+                    else succ(succ(0))
+                }
+          , y = 0
+          , z = succ(0) }
+      }
+    `);
+
+    expect(document.diagnostics ?? []).toHaveLength(2);
+    expect(getDiagnosticCodes(document)).toEqual([
+      "ERROR_MISSING_RECORD_FIELDS",
+      "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+    ]);
+  });
+
   test("supports pair subtyping", async () => {
     document = await parse(`
       language core;
@@ -179,6 +204,12 @@ function formatIssues(document: LangiumDocument<Program>): string {
   return (document.diagnostics ?? [])
     .map((diagnostic) => diagnostic.message)
     .join("\n");
+}
+
+function getDiagnosticCodes(document: LangiumDocument<Program>): string[] {
+  return (document.diagnostics ?? [])
+    .map((diagnostic) => diagnostic.code)
+    .filter((code): code is string => typeof code === "string");
 }
 
 function checkDocumentValid(
