@@ -6,7 +6,6 @@
     "recommendations": [
         "langium.langium-vscode",
         "ZixuanChen.vitest-explorer",
-        "kingwl.vscode-vitest-runner",
-        "openai.chatgpt"
+        "kingwl.vscode-vitest-runner"
     ]
 }

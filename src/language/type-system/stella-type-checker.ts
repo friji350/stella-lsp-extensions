@@ -59,6 +59,28 @@ export interface StellaSpecifics extends TypirLangiumSpecifics {
 
 export type TypirStellaServices = TypirLangiumServices<StellaSpecifics>;
 
+interface StellaTypeContext {
+  typir: TypirServices<StellaSpecifics>;
+  typeAuto: TypirType;
+  typeTop: TypirType;
+  typeBottom: TypirType;
+  areTypesEqual: (left: TypirType, right: TypirType) => boolean;
+  tupleTypeLookup: Map<TypirType, TypirType[]>;
+  sumTypeLookup: Map<TypirType, [TypirType, TypirType]>;
+  recordTypeLookup: Map<TypirType, Map<string, TypirType>>;
+  variantTypeLookup: Map<TypirType, Map<string, TypirType | undefined>>;
+  listTypeLookup: Map<TypirType, TypirType>;
+  referenceTypeLookup: Map<TypirType, TypirType>;
+  forallTypeLookup: Map<TypirType, { params: TypirType[]; body: TypirType }>;
+  typeVariableLookup: Map<TypirType, AstNode>;
+  substituteType: (
+    type: TypirType,
+    substitutions: Map<TypirType, TypirType>
+  ) => TypirType;
+}
+
+type ExpectedTypeMode = "full" | "nonInferenceDriven" | "container" | "direct";
+
 export class StellaTypeSystem
   implements LangiumTypeSystemDefinition<StellaSpecifics>
 {
@@ -105,7 +127,10 @@ export class StellaTypeSystem
     const isAutoType = (type: TypirType | undefined | null): boolean =>
       type === typeAuto;
     const hasExtension = (node: AstNode, extension: Extensions): boolean => {
-      const program = node.$document?.parseResult?.value;
+      let program: AstNode = node;
+      while (program.$container) {
+        program = program.$container as AstNode;
+      }
       return program?.$type === "Program"
         ? getExtensions(program as never).has(extension)
         : false;
@@ -276,6 +301,7 @@ export class StellaTypeSystem
     const listTypeLookup = new Map<TypirType, TypirType>();
     const referenceTypeCache = new Map<string, TypirType>();
     const referenceTypeLookup = new Map<TypirType, TypirType>();
+    let typeContext: StellaTypeContext;
 
     const listTypeKey = (elementType: TypirType) =>
       `${elementType.getIdentifier()}`;
@@ -333,6 +359,25 @@ export class StellaTypeSystem
     };
     
     const functionTypeCache = new Map<string, TypirType>();
+    const typeVariableCache = new WeakMap<AstNode, TypirType>();
+    const typeVariableLookup = new Map<TypirType, AstNode>();
+    const forallTypeCache = new Map<string, TypirType>();
+    const forallTypeLookup = new Map<
+      TypirType,
+      { params: TypirType[]; body: TypirType }
+    >();
+    const astNodeIds = new WeakMap<AstNode, number>();
+    let nextAstNodeId = 1;
+
+    const getAstNodeId = (node: AstNode): number => {
+      const existing = astNodeIds.get(node);
+      if (existing) {
+        return existing;
+      }
+      const created = nextAstNodeId++;
+      astNodeIds.set(node, created);
+      return created;
+    };
 
     const functionTypeKey = (
       paramTypes: TypirType[],
@@ -379,6 +424,166 @@ export class StellaTypeSystem
       return functionType;
     };
 
+    const getOrCreateTypeVariableType = (
+      generic: AstNode & { name?: string }
+    ): TypirType => {
+      const cached = typeVariableCache.get(generic);
+      if (cached) {
+        return cached;
+      }
+
+      const name = generic.name ?? "_";
+      const typeVariable = typir.factory.Primitives.create({
+        primitiveName: `TypeVar<${name}>#${getAstNodeId(generic)}`,
+        associatedLanguageNode: generic,
+      }).finish();
+      typeVariableCache.set(generic, typeVariable);
+      typeVariableLookup.set(typeVariable, generic);
+      return typeVariable;
+    };
+
+    const forallTypeKey = (params: TypirType[], body: TypirType) =>
+      `${params.map((type) => type.getIdentifier()).join(",")}.${body.getIdentifier()}`;
+
+    const forallPrimitiveName = (params: TypirType[], body: TypirType) =>
+      `ForAll<${params
+        .map((type) => typir.Printer.printTypeName(type))
+        .join(", ")} . ${typir.Printer.printTypeName(body)}>`;
+
+    const getOrCreateForallType = (
+      params: TypirType[],
+      body: TypirType,
+      associatedLanguageNode?: AstNode
+    ): TypirType => {
+      const key = forallTypeKey(params, body);
+      const cached = forallTypeCache.get(key);
+      if (cached) {
+        return cached;
+      }
+
+      const forallType = typir.factory.Primitives.create({
+        primitiveName: `${forallPrimitiveName(params, body)}#${key}`,
+        associatedLanguageNode,
+      }).finish();
+      forallTypeCache.set(key, forallType);
+      forallTypeLookup.set(forallType, { params: params.slice(), body });
+      return forallType;
+    };
+
+    const substituteType = (
+      type: TypirType,
+      substitutions: Map<TypirType, TypirType>
+    ): TypirType => {
+      const direct = substitutions.get(type);
+      if (direct) {
+        return direct;
+      }
+
+      const tupleComponents = tupleTypeLookup.get(type);
+      if (tupleComponents) {
+        return getOrCreateTupleType(
+          tupleComponents.map((component) =>
+            substituteType(component, substitutions)
+          )
+        );
+      }
+
+      const sumComponents = sumTypeLookup.get(type);
+      if (sumComponents) {
+        return getOrCreateSumType(
+          substituteType(sumComponents[0], substitutions),
+          substituteType(sumComponents[1], substitutions)
+        );
+      }
+
+      const recordFields = recordTypeLookup.get(type);
+      if (recordFields) {
+        return getOrCreateRecordType(
+          [...recordFields.entries()].map(([label, fieldType]) => ({
+            label,
+            type: substituteType(fieldType, substitutions),
+          }))
+        );
+      }
+
+      const variantFields = variantTypeLookup.get(type);
+      if (variantFields) {
+        return getOrCreateVariantType(
+          [...variantFields.entries()].map(([label, payload]) => ({
+            label,
+            type: payload ? substituteType(payload, substitutions) : undefined,
+          }))
+        );
+      }
+
+      const listElement = listTypeLookup.get(type);
+      if (listElement) {
+        return getOrCreateListType(substituteType(listElement, substitutions));
+      }
+
+      const referenced = referenceTypeLookup.get(type);
+      if (referenced) {
+        return getOrCreateReferenceType(substituteType(referenced, substitutions));
+      }
+
+      const forall = forallTypeLookup.get(type);
+      if (forall) {
+        const nestedSubstitutions = new Map(substitutions);
+        for (const param of forall.params) {
+          nestedSubstitutions.delete(param);
+        }
+        return getOrCreateForallType(
+          forall.params,
+          substituteType(forall.body, nestedSubstitutions)
+        );
+      }
+
+      if (isFunctionType(type)) {
+        const output = type.getOutput("RETURN_UNDEFINED")?.type;
+        if (!output) {
+          return type;
+        }
+
+        return getOrCreateFunctionType(
+          type.getInputs().map((input) =>
+            substituteType(
+              typir.infrastructure.TypeResolver.resolve(input.type),
+              substitutions
+            )
+          ),
+          substituteType(
+            typir.infrastructure.TypeResolver.resolve(output),
+            substitutions
+          )
+        );
+      }
+
+      return type;
+    };
+
+    const getDirectFunctionValueType = (node: AstNode): TypirType | undefined => {
+      const referencedFunction = getDirectReferencedFunction(node);
+      if (!referencedFunction?.returnType) {
+        return undefined;
+      }
+
+      const paramTypes: TypirType[] = [];
+      for (const param of referencedFunction.paramDecls) {
+        const paramType = typir.Inference.inferType(param.paramType);
+        if (Array.isArray(paramType) || !paramType) {
+          return undefined;
+        }
+        paramTypes.push(paramType);
+      }
+
+      const returnType = typir.Inference.inferType(referencedFunction.returnType);
+      if (Array.isArray(returnType) || !returnType) {
+        return undefined;
+      }
+
+      return getOrCreateFunctionType(paramTypes, returnType, referencedFunction);
+    };
+
     const markSubtypeIf = (subType: TypirType, superType: TypirType) => {
       if (subType === superType) {
         return;
@@ -392,6 +597,10 @@ export class StellaTypeSystem
     const registerAutoCompatibility = (candidate: TypirType) => {
       markSubtypeIf(typeAuto, candidate);
     };
+    const isKnownAssignable = (
+      source: TypirType,
+      target: TypirType
+    ): boolean => isStructurallyAssignable(source, target, typeContext);
     const registerTupleSubtyping = (candidate: TypirType) => {
       const candidateComponents = tupleTypeLookup.get(candidate);
       if (!candidateComponents) {
@@ -404,14 +613,14 @@ export class StellaTypeSystem
         }
 
         const candidateIsSubtype = candidateComponents.every((component, index) =>
-          typir.Assignability.isAssignable(component, otherComponents[index])
+          isKnownAssignable(component, otherComponents[index])
         );
         if (candidateIsSubtype) {
           markSubtypeIf(candidate, otherType);
         }
 
         const otherIsSubtype = otherComponents.every((component, index) =>
-          typir.Assignability.isAssignable(component, candidateComponents[index])
+          isKnownAssignable(component, candidateComponents[index])
         );
         if (otherIsSubtype) {
           markSubtypeIf(otherType, candidate);
@@ -427,15 +636,15 @@ export class StellaTypeSystem
 
       for (const [otherType, otherComponents] of sumTypeLookup.entries()) {
         const candidateIsSubtype =
-          typir.Assignability.isAssignable(candidateComponents[0], otherComponents[0]) &&
-          typir.Assignability.isAssignable(candidateComponents[1], otherComponents[1]);
+          isKnownAssignable(candidateComponents[0], otherComponents[0]) &&
+          isKnownAssignable(candidateComponents[1], otherComponents[1]);
         if (candidateIsSubtype) {
           markSubtypeIf(candidate, otherType);
         }
 
         const otherIsSubtype =
-          typir.Assignability.isAssignable(otherComponents[0], candidateComponents[0]) &&
-          typir.Assignability.isAssignable(otherComponents[1], candidateComponents[1]);
+          isKnownAssignable(otherComponents[0], candidateComponents[0]) &&
+          isKnownAssignable(otherComponents[1], candidateComponents[1]);
         if (otherIsSubtype) {
           markSubtypeIf(otherType, candidate);
         }
@@ -454,7 +663,7 @@ export class StellaTypeSystem
             const candidateFieldType = candidateFields.get(label);
             return (
               candidateFieldType !== undefined &&
-              typir.Assignability.isAssignable(candidateFieldType, otherFieldType)
+              isKnownAssignable(candidateFieldType, otherFieldType)
             );
           }
         );
@@ -467,7 +676,7 @@ export class StellaTypeSystem
             const otherFieldType = otherFields.get(label);
             return (
               otherFieldType !== undefined &&
-              typir.Assignability.isAssignable(otherFieldType, candidateFieldType)
+              isKnownAssignable(otherFieldType, candidateFieldType)
             );
           }
         );
@@ -495,7 +704,7 @@ export class StellaTypeSystem
               return candidatePayload === otherPayload;
             }
 
-            return typir.Assignability.isAssignable(candidatePayload, otherPayload);
+            return isKnownAssignable(candidatePayload, otherPayload);
           }
         );
         if (candidateIsSubtype) {
@@ -513,7 +722,7 @@ export class StellaTypeSystem
               return candidatePayload === otherPayload;
             }
 
-            return typir.Assignability.isAssignable(otherPayload, candidatePayload);
+            return isKnownAssignable(otherPayload, candidatePayload);
           }
         );
         if (otherIsSubtype) {
@@ -529,10 +738,10 @@ export class StellaTypeSystem
       }
 
       for (const [otherType, otherElementType] of listTypeLookup.entries()) {
-        if (typir.Assignability.isAssignable(candidateElementType, otherElementType)) {
+        if (isKnownAssignable(candidateElementType, otherElementType)) {
           markSubtypeIf(candidate, otherType);
         }
-        if (typir.Assignability.isAssignable(otherElementType, candidateElementType)) {
+        if (isKnownAssignable(otherElementType, candidateElementType)) {
           markSubtypeIf(otherType, candidate);
         }
       }
@@ -546,15 +755,15 @@ export class StellaTypeSystem
 
       for (const [otherType, otherReferencedType] of referenceTypeLookup.entries()) {
         const candidateIsSubtype =
-          typir.Assignability.isAssignable(candidateReferencedType, otherReferencedType) &&
-          typir.Assignability.isAssignable(otherReferencedType, candidateReferencedType);
+          isKnownAssignable(candidateReferencedType, otherReferencedType) &&
+          isKnownAssignable(otherReferencedType, candidateReferencedType);
         if (candidateIsSubtype) {
           markSubtypeIf(candidate, otherType);
         }
 
         const otherIsSubtype =
-          typir.Assignability.isAssignable(otherReferencedType, candidateReferencedType) &&
-          typir.Assignability.isAssignable(candidateReferencedType, otherReferencedType);
+          isKnownAssignable(otherReferencedType, candidateReferencedType) &&
+          isKnownAssignable(candidateReferencedType, otherReferencedType);
         if (otherIsSubtype) {
           markSubtypeIf(otherType, candidate);
         }
@@ -584,9 +793,9 @@ export class StellaTypeSystem
         }
 
         const candidateIsSubtype =
-          typir.Assignability.isAssignable(candidateOutput.type, otherOutput.type) &&
+          isKnownAssignable(candidateOutput.type, otherOutput.type) &&
           candidateInputs.every((candidateInput, index) =>
-            typir.Assignability.isAssignable(
+            isKnownAssignable(
               otherInputs[index].type,
               candidateInput.type
             )
@@ -596,9 +805,9 @@ export class StellaTypeSystem
         }
 
         const otherIsSubtype =
-          typir.Assignability.isAssignable(otherOutput.type, candidateOutput.type) &&
+          isKnownAssignable(otherOutput.type, candidateOutput.type) &&
           otherInputs.every((otherInput, index) =>
-            typir.Assignability.isAssignable(
+            isKnownAssignable(
               candidateInputs[index].type,
               otherInput.type
             )
@@ -628,6 +837,23 @@ export class StellaTypeSystem
     const typeBottom = typir.factory.Bottom.create({})
       .inferenceRule({ languageKey: TypeBottom.$type })
       .finish();
+
+    typeContext = {
+      typir,
+      typeAuto,
+      typeTop,
+      typeBottom,
+      areTypesEqual,
+      tupleTypeLookup,
+      sumTypeLookup,
+      recordTypeLookup,
+      variantTypeLookup,
+      listTypeLookup,
+      referenceTypeLookup,
+      forallTypeLookup,
+      typeVariableLookup,
+      substituteType,
+    };
 
     registerAutoCompatibility(typeNat);
     registerAutoCompatibility(typeBool);
@@ -667,15 +893,49 @@ export class StellaTypeSystem
     // Inference rules
     typir.Inference.addInferenceRulesForAstNodes({
       Var: (node) => node.ref.ref ?? InferenceRuleNotApplicable, // The type of a variable is the type of the declaration it points to
+      DeclFunGeneric: (node, typir) => {
+        const paramTypes: TypirType[] = [];
+        for (const param of node.paramDecls) {
+          const paramType = typir.Inference.inferType(param.paramType);
+          if (Array.isArray(paramType) || !paramType) {
+            return InferenceRuleNotApplicable;
+          }
+          paramTypes.push(paramType);
+        }
+
+        if (!node.returnType) {
+          return InferenceRuleNotApplicable;
+        }
+        const returnType = typir.Inference.inferType(node.returnType);
+        if (Array.isArray(returnType) || !returnType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        return getOrCreateForallType(
+          node.generics.map((generic) => getOrCreateTypeVariableType(generic)),
+          getOrCreateFunctionType(paramTypes, returnType, node),
+          node
+        );
+      },
       Application: (node, typir) => {
         if (isVar(node.fun)) {
           const referenced = node.fun.ref.ref as
             | (AstNode & {
-                $type: "DeclFun" | "DeclFunGeneric";
+                $type: "DeclFun";
                 returnType?: AstNode;
+                returnExpr?: AstNode;
               })
             | undefined;
-          if (referenced?.returnType) {
+          if (
+            referenced?.$type === "DeclFun" &&
+            referenced.returnExpr?.$type === "Abstraction"
+          ) {
+            const actualReturnType = typir.Inference.inferType(referenced.returnExpr);
+            if (!Array.isArray(actualReturnType) && actualReturnType) {
+              return actualReturnType;
+            }
+          }
+          if (referenced?.$type === "DeclFun" && referenced.returnType) {
             const declaredReturnType = typir.Inference.inferType(
               referenced.returnType
             );
@@ -705,6 +965,58 @@ export class StellaTypeSystem
         return typir.infrastructure.TypeResolver.resolve(outputDescriptor);
       },
       ParamDecl: (node) => node.paramType,
+      TypeVar: (node) => {
+        const referenced = node.ref.ref as AstNode | undefined;
+        return referenced?.$type === "GenericTypeVar"
+          ? getOrCreateTypeVariableType(referenced as AstNode & { name?: string })
+          : InferenceRuleNotApplicable;
+      },
+      TypeForAll: (node, typir) => {
+        const bodyType = typir.Inference.inferType(node.type);
+        if (Array.isArray(bodyType) || !bodyType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        return getOrCreateForallType(
+          node.types.map((generic) => getOrCreateTypeVariableType(generic)),
+          bodyType,
+          node
+        );
+      },
+      TypeAbstraction: (node, typir) => {
+        const bodyType = typir.Inference.inferType(node.expr);
+        if (Array.isArray(bodyType) || !bodyType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        return getOrCreateForallType(
+          node.generics.map((generic) => getOrCreateTypeVariableType(generic)),
+          bodyType,
+          node
+        );
+      },
+      TypeApplication: (node, typir) => {
+        const genericType = typir.Inference.inferType(node.fun);
+        if (Array.isArray(genericType) || !genericType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        const forall = forallTypeLookup.get(genericType);
+        if (!forall || forall.params.length !== node.types.length) {
+          return InferenceRuleNotApplicable;
+        }
+
+        const substitutions = new Map<TypirType, TypirType>();
+        for (let index = 0; index < forall.params.length; index++) {
+          const argumentType = typir.Inference.inferType(node.types[index]);
+          if (Array.isArray(argumentType) || !argumentType) {
+            return InferenceRuleNotApplicable;
+          }
+          substitutions.set(forall.params[index], argumentType);
+        }
+
+        return substituteType(forall.body, substitutions);
+      },
       TypeTuple: (node, typir) => {
         if (node.types.length < 2) return InferenceRuleNotApplicable;
 
@@ -797,12 +1109,7 @@ export class StellaTypeSystem
         return fieldType;
       },
       Variant: (node, typir) => {
-        const expected = getExpectedVariantType(
-          node,
-          typir,
-          variantTypeLookup,
-          referenceTypeLookup
-        );
+        const expected = getExpectedVariantType(node, typeContext);
         if (!expected || Array.isArray(expected)) {
           return InferenceRuleNotApplicable;
         }
@@ -953,7 +1260,8 @@ export class StellaTypeSystem
             tryType,
             fallbackType,
             typeBottom,
-            areTypesEqual
+            areTypesEqual,
+            isKnownAssignable
           ) ?? InferenceRuleNotApplicable
         );
       },
@@ -973,18 +1281,50 @@ export class StellaTypeSystem
             tryType,
             fallbackType,
             typeBottom,
-            areTypesEqual
+            areTypesEqual,
+            isKnownAssignable
+          ) ?? InferenceRuleNotApplicable
+        );
+      },
+      TryCastAs: (node, typir) => {
+        const tryType = typir.Inference.inferType(node.expr);
+        if (Array.isArray(tryType) || !tryType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        const fallbackType = typir.Inference.inferType(node.fallbackExpr);
+        if (Array.isArray(fallbackType) || !fallbackType) {
+          return InferenceRuleNotApplicable;
+        }
+
+        return (
+          getCompatibleExpressionType(
+            tryType,
+            fallbackType,
+            typeBottom,
+            areTypesEqual,
+            isKnownAssignable
           ) ?? InferenceRuleNotApplicable
         );
       },
       ConstMemory: (node, typir) => {
         const expectedReferenceType = getExpectedReferenceType(
           node,
-          typir,
-          referenceTypeLookup
+          typeContext
         );
         if (expectedReferenceType) {
           return expectedReferenceType;
+        }
+
+        let ancestor = node.$container as AstNode | undefined;
+        while (ancestor) {
+          if (ancestor.$type === "Deref") {
+            const expectedDerefType = findExpectedType(ancestor, typeContext);
+            if (!Array.isArray(expectedDerefType) && expectedDerefType) {
+              return getOrCreateReferenceType(expectedDerefType, node);
+            }
+          }
+          ancestor = ancestor.$container as AstNode | undefined;
         }
 
         const assign = node.$container;
@@ -1002,7 +1342,7 @@ export class StellaTypeSystem
       },
       List: (node, typir) => {
         if (node.exprs.length === 0) {
-          const expected = getExpectedListType(node, typir, listTypeLookup);
+          const expected = getExpectedListType(node, typeContext);
           if (!expected || Array.isArray(expected)) {
             return InferenceRuleNotApplicable;
           }
@@ -1018,7 +1358,7 @@ export class StellaTypeSystem
           elementTypes.push(exprType);
         }
 
-        const expectedListType = getExpectedListType(node, typir, listTypeLookup);
+        const expectedListType = getExpectedListType(node, typeContext);
         const expectedElementType = expectedListType
           ? listTypeLookup.get(expectedListType)
           : undefined;
@@ -1097,12 +1437,7 @@ export class StellaTypeSystem
         return typeBool ?? InferenceRuleNotApplicable;
       },
       Inl: (node, typir) => {
-        const expectedSum = getExpectedSumType(
-          node,
-          typir,
-          sumTypeLookup,
-          tupleTypeLookup
-        );
+        const expectedSum = getExpectedSumType(node, typeContext);
         if (!expectedSum || Array.isArray(expectedSum)) {
           if (!hasExtension(node, Extensions.AmbiguousTypeAsBottom)) {
             return InferenceRuleNotApplicable;
@@ -1119,12 +1454,7 @@ export class StellaTypeSystem
         return expectedSum;
       },
       Inr: (node, typir) => {
-        const expectedSum = getExpectedSumType(
-          node,
-          typir,
-          sumTypeLookup,
-          tupleTypeLookup
-        );
+        const expectedSum = getExpectedSumType(node, typeContext);
         if (!expectedSum || Array.isArray(expectedSum)) {
           if (!hasExtension(node, Extensions.AmbiguousTypeAsBottom)) {
             return InferenceRuleNotApplicable;
@@ -1160,7 +1490,8 @@ export class StellaTypeSystem
               first,
               branchType,
               typeBottom,
-              areTypesEqual
+              areTypesEqual,
+              isKnownAssignable
             )
           ) {
             return InferenceRuleNotApplicable;
@@ -1173,7 +1504,8 @@ export class StellaTypeSystem
               current,
               branchType,
               typeBottom,
-              areTypesEqual
+              areTypesEqual,
+              isKnownAssignable
             ) ?? current,
           first
         );
@@ -1210,21 +1542,44 @@ export class StellaTypeSystem
         const cond = typir.Inference.inferType(node.condition);
         if (Array.isArray(cond) || cond !== typeBool) return InferenceRuleNotApplicable;
 
+        const container = node.$container as AstNode | undefined;
+        if (
+          container?.$type === "Deref" &&
+          (container as { expr?: AstNode }).expr === node
+        ) {
+          const expectedDerefType = findExpectedType(container, typeContext);
+          if (!Array.isArray(expectedDerefType) && expectedDerefType) {
+            return getOrCreateReferenceType(expectedDerefType, node);
+          }
+        }
+
         const t1 = typir.Inference.inferType(node.thenExpr);
         if (Array.isArray(t1)) return InferenceRuleNotApplicable;
 
         const t2 = typir.Inference.inferType(node.elseExpr);
         if (Array.isArray(t2)) return InferenceRuleNotApplicable;
 
-        if (t1 !== t2) return InferenceRuleNotApplicable;
+        if (t1 && t2) {
+          return (
+            getCompatibleExpressionType(
+              t1,
+              t2,
+              typeBottom,
+              areTypesEqual,
+              isKnownAssignable
+            ) ?? InferenceRuleNotApplicable
+          );
+        }
 
-        return t1;
-        },
+        const expected = findExpectedType(node, typeContext);
+        return expected ?? InferenceRuleNotApplicable;
+      },
       PatternVar: (node, typir) => {
         const expectedType = getExpectedPatternType(node, typir, {
           typeNat,
           typeBool,
           typeUnit,
+          typeAuto,
           tupleTypeLookup,
           sumTypeLookup,
           recordTypeLookup,
@@ -1240,6 +1595,11 @@ export class StellaTypeSystem
         if (Array.isArray(bodyType)) return InferenceRuleNotApplicable;
         return bodyType;
       },
+      LetRec: (node, typir) => {
+        const bodyType = typir.Inference.inferType(node.body);
+        if (Array.isArray(bodyType)) return InferenceRuleNotApplicable;
+        return bodyType;
+      },
       TypeAsc: (node, typir) => {
         const exprType = typir.Inference.inferType(node.expr);
         if (Array.isArray(exprType)) return InferenceRuleNotApplicable;
@@ -1248,6 +1608,10 @@ export class StellaTypeSystem
         if (Array.isArray(ascribedType)) return InferenceRuleNotApplicable;
 
         return ascribedType;
+      },
+      TypeCast: (node, typir) => {
+        const castType = typir.Inference.inferType(node.type);
+        return Array.isArray(castType) ? InferenceRuleNotApplicable : castType;
       },
       ParenthesisedExpr: (node, typir) => {
         const innerType = typir.Inference.inferType(node.expr);
@@ -1264,13 +1628,52 @@ export class StellaTypeSystem
           return;
         }
 
+        if (
+          typir.Inference.inferType(node.returnType) === typeAuto &&
+          isVar(node.returnExpr) &&
+          node.returnExpr.ref.ref === node
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_OCCURS_CHECK_INFINITE_TYPE",
+            message: "Type reconstruction would require an infinite type.",
+            languageNode: node.returnExpr,
+          });
+        }
+
         const declaredReturnType = typir.Inference.inferType(node.returnType);
 
         if (declaredReturnType !== typeAuto) {
+          const returnedFunctionType = getDirectFunctionValueType(node.returnExpr);
+          if (
+            returnedFunctionType &&
+            !Array.isArray(declaredReturnType) &&
+            !isKnownAssignable(returnedFunctionType, declaredReturnType)
+          ) {
+            accept({
+              severity: "error",
+              code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+              message: `The return type of function ${node.name} is ${userRepr(returnedFunctionType)}, but the declared return type is ${userRepr(declaredReturnType)}`,
+              languageNode: node.returnExpr,
+            });
+            return;
+          }
+
           if (
             !Array.isArray(declaredReturnType) &&
             node.returnExpr.$type === "Record" &&
             recordTypeLookup.has(declaredReturnType)
+          ) {
+            return;
+          }
+
+          const actualReturnType = typir.Inference.inferType(node.returnExpr);
+          if (
+            !Array.isArray(declaredReturnType) &&
+            declaredReturnType &&
+            !Array.isArray(actualReturnType) &&
+            actualReturnType &&
+            isKnownAssignable(actualReturnType, declaredReturnType)
           ) {
             return;
           }
@@ -1285,6 +1688,45 @@ export class StellaTypeSystem
           );
         }
       },
+      DeclFunGeneric: (node, accept, typir) => {
+        const seen = new Set<string>();
+        for (const generic of node.generics) {
+          if (seen.has(generic.name)) {
+            accept({
+              severity: "error",
+              code: "ERROR_DUPLICATE_TYPE_PARAMETER",
+              message: `Duplicate type parameter '${generic.name}'.`,
+              languageNode: generic,
+            });
+          }
+          seen.add(generic.name);
+        }
+
+        if (!node.returnType) {
+          return;
+        }
+
+        const declaredReturnType = typir.Inference.inferType(node.returnType);
+        if (
+          !Array.isArray(declaredReturnType) &&
+          declaredReturnType &&
+          declaredReturnType !== typeAuto
+        ) {
+          const actualReturnType = typir.Inference.inferType(node.returnExpr);
+          if (
+            !Array.isArray(actualReturnType) &&
+            actualReturnType &&
+            !isKnownAssignable(actualReturnType, declaredReturnType)
+          ) {
+            accept({
+              severity: "error",
+              code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+              message: `The return type of generic function ${node.name} is ${userRepr(actualReturnType)}, but the declared return type is ${userRepr(declaredReturnType)}`,
+              languageNode: node.returnExpr,
+            });
+          }
+        }
+      },
 
       If: (node, accept, typir) => {
         const conditionType = typir.Inference.inferType(node.condition);
@@ -1294,6 +1736,7 @@ export class StellaTypeSystem
           typeBool,
           accept,
           (actual, expected) => ({
+            code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
             message: `The condition of 'if' must have type ${userRepr(expected)}, but it has type ${userRepr(actual)}`,
           })
         );
@@ -1301,7 +1744,29 @@ export class StellaTypeSystem
 
         const thenType = typir.Inference.inferType(node.thenExpr);
         const elseType = typir.Inference.inferType(node.elseExpr);
-        const expectedType = findExpectedType(node, typir);
+        const expectedType = findExpectedType(node, typeContext);
+        const thenCallableType =
+          getDirectFunctionValueType(node.thenExpr) ??
+          getCallableType(node.thenExpr, typir);
+        const elseCallableType =
+          getDirectFunctionValueType(node.elseExpr) ??
+          getCallableType(node.elseExpr, typir);
+        if (
+          thenCallableType &&
+          elseCallableType &&
+          isFunctionType(thenCallableType) &&
+          isFunctionType(elseCallableType) &&
+          !areTypesEqual(thenCallableType, elseCallableType)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+            message: `The 'else' branch of 'if' must have type ${userRepr(thenCallableType)}, but it has type ${userRepr(elseCallableType)}`,
+            languageNode: node.elseExpr,
+          });
+          return;
+        }
+
         if (
           !Array.isArray(thenType) &&
           thenType &&
@@ -1309,18 +1774,73 @@ export class StellaTypeSystem
           elseType
         ) {
           if (
-            getCompatibleExpressionType(thenType, elseType, typeBottom, areTypesEqual)
+            getCompatibleExpressionType(
+              thenType,
+              elseType,
+              typeBottom,
+              areTypesEqual,
+              isKnownAssignable
+            )
           ) {
             return;
           }
 
           if (
             expectedType &&
-            typir.Assignability.isAssignable(thenType, expectedType) &&
-            typir.Assignability.isAssignable(elseType, expectedType)
+            isKnownAssignable(thenType, expectedType) &&
+            isKnownAssignable(elseType, expectedType)
           ) {
             return;
           }
+        }
+
+        if (
+          isVar(node.thenExpr) &&
+          isVar(node.elseExpr) &&
+          node.thenExpr.ref.ref?.$type === "DeclFun" &&
+          node.elseExpr.ref.ref?.$type === "DeclFun" &&
+          thenCallableType &&
+          elseCallableType &&
+          !areTypesEqual(thenCallableType, elseCallableType)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+            message: `The branches of 'if' have incompatible function types.`,
+            languageNode: node,
+          });
+          return;
+        }
+
+        if (
+          thenCallableType &&
+          elseCallableType &&
+          isFunctionType(thenCallableType) &&
+          isFunctionType(elseCallableType) &&
+          !areTypesEqual(thenCallableType, elseCallableType)
+        ) {
+          if (
+            !isKnownAssignable(elseCallableType, thenCallableType)
+          ) {
+            accept({
+              severity: "error",
+              code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+              message: `The 'else' branch of 'if' must have type ${userRepr(thenCallableType)}, but it has type ${userRepr(elseCallableType)}`,
+              languageNode: node.elseExpr,
+            });
+            return;
+          }
+        }
+
+        if (!Array.isArray(thenType) && thenType) {
+          return typir.validation.Constraints.ensureNodeIsAssignable(
+            node.elseExpr,
+            thenType,
+            accept,
+            (actual, expected) => ({
+              message: `The 'else' branch of 'if' must have type ${userRepr(expected)}, but it has type ${userRepr(actual)}`,
+            })
+          );
         }
 
         return typir.validation.Constraints.ensureNodeIsAssignable(
@@ -1353,11 +1873,19 @@ export class StellaTypeSystem
         if (argumentType === typeAuto) {
           return;
         }
+        const fromCastPattern =
+          isVar(node.n) &&
+          node.n.ref.ref?.$type === "PatternVar" &&
+          (hasAncestor(node.n.ref.ref as AstNode, "PatternCastAs") ||
+            hasAncestor(node.n.ref.ref as AstNode, "TryCastAs"));
         return typir.validation.Constraints.ensureNodeIsAssignable(
           node.n,
           typeNat,
           accept,
           (actual, expected) => ({
+            code: fromCastPattern
+              ? "ERROR_UNEXPECTED_SUBTYPE"
+              : "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
             message: `'Nat::iszero' expects its argument to have type ${userRepr(expected)}, but it has type ${userRepr(actual)}`,
           })
         );
@@ -1382,6 +1910,20 @@ export class StellaTypeSystem
         }
       },
       Application: (node, accept, typir) => {
+        const selfAppliedRef = isVar(node.fun) ? node.fun.ref.ref : undefined;
+        if (
+          selfAppliedRef &&
+          node.args.some((arg) => isVar(arg) && arg.ref.ref === selfAppliedRef)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_OCCURS_CHECK_INFINITE_TYPE",
+            message: "Type reconstruction would require an infinite type.",
+            languageNode: node,
+          });
+          return;
+        }
+
         const referencedFunction = getDirectReferencedFunction(node.fun);
         if (referencedFunction) {
           if (referencedFunction.paramDecls.length !== node.args.length) {
@@ -1407,17 +1949,7 @@ export class StellaTypeSystem
               isTypeCompatibleWithAuto(
                 actualType,
                 expectedType,
-                {
-                  typeAuto,
-                  areTypesEqual,
-                  tupleTypeLookup,
-                  sumTypeLookup,
-                  recordTypeLookup,
-                  variantTypeLookup,
-                  listTypeLookup,
-                  referenceTypeLookup,
-                },
-                typir
+                typeContext
               )
             ) {
               continue;
@@ -1445,8 +1977,20 @@ export class StellaTypeSystem
         }
 
         if (!isFunctionType(functionType)) {
+          const underlyingFunctionExpr = unwrapParenthesisedExpr(node.fun);
+          const panicLikeFunction =
+            containsNodeType(underlyingFunctionExpr, "Panic") ||
+            containsNodeType(underlyingFunctionExpr, "Throw");
           accept({
             severity: "error",
+            code:
+              panicLikeFunction
+                ? containsNodeType(underlyingFunctionExpr, "Panic")
+                  ? "ERROR_AMBIGUOUS_PANIC_TYPE"
+                  : "ERROR_AMBIGUOUS_THROW_TYPE"
+                : underlyingFunctionExpr.$type === "NatRec"
+                  ? "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION"
+                  : "ERROR_NOT_A_FUNCTION",
             message: `Only functions can be applied, but this expression has type ${userRepr(functionType)}.`,
             languageNode: node.fun,
           });
@@ -1464,9 +2008,21 @@ export class StellaTypeSystem
         }
 
         for (let index = 0; index < inputs.length; index++) {
+          const expectedType = typir.infrastructure.TypeResolver.resolve(
+            inputs[index].type
+          );
+          const actualType = typir.Inference.inferType(node.args[index]);
+          if (
+            !Array.isArray(actualType) &&
+            actualType &&
+            isKnownAssignable(actualType, expectedType)
+          ) {
+            continue;
+          }
+
           typir.validation.Constraints.ensureNodeIsAssignable(
             node.args[index],
-            inputs[index].type,
+            expectedType,
             accept,
             (actual, expected) => ({
               message: `Argument ${index + 1} must have type ${userRepr(expected)}, but it has type ${userRepr(actual)}.`,
@@ -1474,17 +2030,44 @@ export class StellaTypeSystem
           );
         }
       },
-      TypeApplication: (node, accept) => {
-        if (!isVar(node.fun)) {
+      TypeApplication: (node, accept, typir) => {
+        if (isVar(node.fun) && node.fun.ref.ref?.$type === "DeclFun") {
+          const functionType = typir.Inference.inferType(node.fun.ref.ref);
+          accept({
+            severity: "error",
+            code: "ERROR_NOT_A_GENERIC_FUNCTION",
+            message: `Only generic functions can receive type arguments, but this expression has type ${
+              !Array.isArray(functionType) && functionType
+                ? userRepr(functionType)
+                : "unknown"
+            }.`,
+            languageNode: node.fun,
+          });
           return;
         }
 
-        const referencedFunction = getDirectReferencedFunction(node.fun);
-        if (referencedFunction?.$type === "DeclFun") {
+        const genericType = typir.Inference.inferType(node.fun);
+        if (Array.isArray(genericType) || !genericType) {
+          return;
+        }
+
+        const forall = forallTypeLookup.get(genericType);
+        if (!forall) {
           accept({
             severity: "error",
-            message: "Type arguments can only be applied to generic functions.",
+            code: "ERROR_NOT_A_GENERIC_FUNCTION",
+            message: `Only generic functions can receive type arguments, but this expression has type ${userRepr(genericType)}.`,
             languageNode: node.fun,
+          });
+          return;
+        }
+
+        if (forall.params.length !== node.types.length) {
+          accept({
+            severity: "error",
+            code: "ERROR_INCORRECT_NUMBER_OF_TYPE_ARGUMENTS",
+            message: `This generic function expects ${forall.params.length} type argument(s), but ${node.types.length} were provided.`,
+            languageNode: node,
           });
         }
       },
@@ -1545,6 +2128,19 @@ export class StellaTypeSystem
           return;
         }
 
+        if (
+          !hasExtension(node, Extensions.AmbiguousTypeAsBottom) &&
+          !findNonInferenceDrivenExpectedType(node, typeContext)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_AMBIGUOUS_THROW_TYPE",
+            message:
+              "cannot infer type for throw (use type ascriptions or enable #ambiguous-type-as-bottom)",
+            languageNode: node,
+          });
+        }
+
         if (exceptionType !== typeAuto) {
           typir.validation.Constraints.ensureNodeIsAssignable(
             node.expr,
@@ -1583,7 +2179,8 @@ export class StellaTypeSystem
             tryType,
             fallbackType,
             typeBottom,
-            areTypesEqual
+            areTypesEqual,
+            isKnownAssignable
           )
         ) {
           accept({
@@ -1630,7 +2227,8 @@ export class StellaTypeSystem
             tryType,
             fallbackType,
             typeBottom,
-            areTypesEqual
+            areTypesEqual,
+            isKnownAssignable
           )
         ) {
           accept({
@@ -1638,6 +2236,65 @@ export class StellaTypeSystem
             message: `The try-expression has type ${userRepr(tryType)}, but the catch fallback has type ${userRepr(fallbackType)}.`,
             languageNode: node.fallbackExpr,
           });
+        }
+      },
+      TryCastAs: (node, accept, typir) => {
+        const scrutineeType = typir.Inference.inferType(node.tryExpr);
+        const castType = typir.Inference.inferType(node.type);
+        if (
+          Array.isArray(scrutineeType) ||
+          Array.isArray(castType) ||
+          !scrutineeType ||
+          !castType
+        ) {
+          return;
+        }
+
+        if (
+          !isKnownAssignable(castType, scrutineeType) &&
+          !isKnownAssignable(scrutineeType, castType)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_UNEXPECTED_SUBTYPE",
+            message: `Cannot cast ${userRepr(scrutineeType)} as unrelated type ${userRepr(castType)}.`,
+            languageNode: node,
+          });
+        }
+
+        validatePatternAgainstType(node.pattern, castType, accept, {
+          typeNat,
+          typeBool,
+          typeUnit,
+          userRepr,
+          tupleTypeLookup,
+          sumTypeLookup,
+          recordTypeLookup,
+          variantTypeLookup,
+          listTypeLookup,
+          areTypesEqual,
+        });
+      },
+      LetRec: (node, accept, typir) => {
+        for (const binding of node.patternBindings) {
+          if (binding.pattern.$type !== "PatternVar") {
+            continue;
+          }
+
+          const rhsNode = binding.rhs as AstNode;
+          if (rhsNode.$type !== "Abstraction") {
+            continue;
+          }
+
+          const rhsReturnExpr = (rhsNode as { returnExpr?: AstNode }).returnExpr;
+          if (rhsReturnExpr?.$type === "Abstraction") {
+            accept({
+              severity: "error",
+              code: "ERROR_AMBIGUOUS_PATTERN_TYPE",
+              message: "cannot infer the type for recursive pattern binding",
+              languageNode: binding.pattern,
+            });
+          }
         }
       },
       Fix: (node, accept, typir) => {
@@ -1691,11 +2348,31 @@ export class StellaTypeSystem
         ) {
           accept({
             severity: "error",
+            code: "ERROR_AMBIGUOUS_REFERENCE_TYPE",
             message:
               "Cannot infer the referenced type of a memory address literal. Add an annotation like '<0x0> as &T' or use it where a reference type is expected.",
             languageNode: node,
           });
         }
+      },
+      Panic: (node, accept, typir) => {
+        if (
+          hasExtension(node, Extensions.AmbiguousTypeAsBottom) ||
+          findNonInferenceDrivenExpectedType(node, typeContext) ||
+          (findExpectedType(node, typeContext) &&
+            !hasApplicationFunctionAncestor(node)) ||
+          hasTypeConstrainingContext(node)
+        ) {
+          return;
+        }
+
+        accept({
+          severity: "error",
+          code: "ERROR_AMBIGUOUS_PANIC_TYPE",
+          message:
+            "cannot infer type for panic (use type ascriptions or enable #ambiguous-type-as-bottom)",
+          languageNode: node,
+        });
       },
       Abstraction: (node, accept, typir) => {
         const functionType = typir.Inference.inferType(node);
@@ -1722,6 +2399,34 @@ export class StellaTypeSystem
             message: `The body of this lambda must have type ${userRepr(expected)}, but it has type ${userRepr(actual)}`,
           })
         );
+      },
+      TypeAbstraction: (node, accept) => {
+        const seen = new Set<string>();
+        for (const generic of node.generics) {
+          if (seen.has(generic.name)) {
+            accept({
+              severity: "error",
+              code: "ERROR_DUPLICATE_TYPE_PARAMETER",
+              message: `Duplicate type parameter '${generic.name}'.`,
+              languageNode: generic,
+            });
+          }
+          seen.add(generic.name);
+        }
+      },
+      TypeForAll: (node, accept) => {
+        const seen = new Set<string>();
+        for (const generic of node.types) {
+          if (seen.has(generic.name)) {
+            accept({
+              severity: "error",
+              code: "ERROR_DUPLICATE_TYPE_PARAMETER",
+              message: `Duplicate type parameter '${generic.name}'.`,
+              languageNode: generic,
+            });
+          }
+          seen.add(generic.name);
+        }
       },
       TypeTuple: (node, accept) => {
         if (node.types.length < 2) {
@@ -1761,14 +2466,98 @@ export class StellaTypeSystem
         }
       },
       TypeAsc: (node, accept, typir) => {
+        const directExpected = findDirectExpectedType(node, typeContext);
+        const ascribedType = typir.Inference.inferType(node.type);
+        const actualType = typir.Inference.inferType(node.expr);
+        if (
+          directExpected &&
+          !Array.isArray(directExpected) &&
+          ascribedType &&
+          !Array.isArray(ascribedType) &&
+          !isKnownAssignable(ascribedType, directExpected)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+            message: `An expression annotated with 'as' has type ${userRepr(ascribedType)}, but ${userRepr(directExpected)} is expected.`,
+            languageNode: node.expr,
+          });
+        }
+
+        if (
+          !hasExtension(node, Extensions.StructuralSubtyping) &&
+          ascribedType &&
+          !Array.isArray(ascribedType) &&
+          actualType &&
+          !Array.isArray(actualType)
+        ) {
+          const actualRecord = recordTypeLookup.get(actualType);
+          const ascribedRecord = recordTypeLookup.get(ascribedType);
+          if (
+            actualRecord &&
+            ascribedRecord &&
+            !areRecordsExactlyCompatible(actualRecord, ascribedRecord, areTypesEqual)
+          ) {
+            accept({
+              severity: "error",
+              code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+              message: `An expression annotated with 'as' must have type ${userRepr(ascribedType)}, but it has type ${userRepr(actualType)}`,
+              languageNode: node.expr,
+            });
+            return;
+          }
+        }
+
         return typir.validation.Constraints.ensureNodeIsAssignable(
           node.expr,
           node.type,
           accept,
           (actual, expected) => ({
+            code:
+              node.expr.$type === "Inl" || node.expr.$type === "Inr"
+                ? "ERROR_UNEXPECTED_INJECTION"
+                : "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
             message: `An expression annotated with 'as' must have type ${userRepr(expected)}, but it has type ${userRepr(actual)}`,
           })
         );
+      },
+      TypeCast: (node, accept, typir) => {
+        const actualType = typir.Inference.inferType(node.expr);
+        const castType = typir.Inference.inferType(node.type);
+        if (
+          Array.isArray(actualType) ||
+          Array.isArray(castType) ||
+          !actualType ||
+          !castType
+        ) {
+          return;
+        }
+
+        if (
+          !isKnownAssignable(actualType, castType) &&
+          !isKnownAssignable(castType, actualType)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_UNEXPECTED_SUBTYPE",
+            message: `Cannot cast ${userRepr(actualType)} as unrelated type ${userRepr(castType)}.`,
+            languageNode: node.expr,
+          });
+        }
+
+        const directExpected = findDirectExpectedType(node, typeContext);
+        if (
+          directExpected &&
+          !Array.isArray(directExpected) &&
+          !isKnownAssignable(castType, directExpected)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+            message: `Cast result has type ${userRepr(castType)}, but ${userRepr(directExpected)} is expected.`,
+            languageNode: node,
+          });
+        }
       },
       Tuple: (node, accept) => {
         if (node.exprs.length < 2) {
@@ -1793,11 +2582,7 @@ export class StellaTypeSystem
           seen.add(binding.name);
         }
 
-        const expectedRecordType = getExpectedRecordType(
-          node,
-          typir,
-          recordTypeLookup
-        );
+        const expectedRecordType = getExpectedRecordType(node, typeContext);
         if (!expectedRecordType) {
           return;
         }
@@ -1811,11 +2596,26 @@ export class StellaTypeSystem
         const missingFields = [...expectedFields.keys()].filter(
           (label) => !actualBindings.has(label)
         );
+        const unexpectedFields = [...actualBindings.keys()].filter(
+          (label) => !expectedFields.has(label)
+        );
+        const allowRecordWidth = hasExtension(
+          node,
+          Extensions.StructuralSubtyping
+        );
         if (missingFields.length > 0) {
           accept({
             severity: "error",
             code: "ERROR_MISSING_RECORD_FIELDS",
             message: `Missing record field(s): ${missingFields.join(", ")}.`,
+            languageNode: node,
+          });
+        }
+        if (!allowRecordWidth && unexpectedFields.length > 0) {
+          accept({
+            severity: "error",
+            code: "ERROR_UNEXPECTED_RECORD_FIELDS",
+            message: `Unexpected record field(s): ${unexpectedFields.join(", ")}.`,
             languageNode: node,
           });
         }
@@ -1831,7 +2631,14 @@ export class StellaTypeSystem
             continue;
           }
 
-          if (typir.Assignability.isAssignable(actualFieldType, expectedFieldType)) {
+          if (
+            isTypeCompatibleWithAuto(
+              actualFieldType,
+              expectedFieldType,
+              typeContext
+            ) ||
+            isKnownAssignable(actualFieldType, expectedFieldType)
+          ) {
             continue;
           }
 
@@ -1844,15 +2651,42 @@ export class StellaTypeSystem
         }
       },
       Variant: (node, accept, typir) => {
-        const expected = getExpectedVariantType(
+        const openExceptionPayloadType = getDeclaredExceptionVariantPayloadType(
           node,
-          typir,
-          variantTypeLookup,
-          referenceTypeLookup
+          node.label,
+          typir
         );
+        if (
+          openExceptionPayloadType &&
+          node.$container?.$type === "Throw" &&
+          (node.$container as { expr?: AstNode }).expr === node
+        ) {
+          if (!node.rhs) {
+            accept({
+              severity: "error",
+              message: `Exception variant '${node.label}' requires a value of type ${userRepr(openExceptionPayloadType)}.`,
+              languageNode: node,
+              languageProperty: "label",
+            });
+            return;
+          }
+
+          typir.validation.Constraints.ensureNodeIsAssignable(
+            node.rhs,
+            openExceptionPayloadType,
+            accept,
+            (actual, expectedTypeAnnotation) => ({
+              message: `Exception variant '${node.label}' expects ${userRepr(expectedTypeAnnotation)}, but got ${userRepr(actual)}.`,
+            })
+          );
+          return;
+        }
+
+        const expected = getExpectedVariantType(node, typeContext);
         if (!expected || Array.isArray(expected)) {
           accept({
             severity: "error",
+            code: "ERROR_AMBIGUOUS_VARIANT_TYPE",
             message:
               "It is not possible to infer the variant type. Add an annotation like 'as <| l: T |>' or use it in the context of an expected type.",
             languageNode: node,
@@ -1908,6 +2742,27 @@ export class StellaTypeSystem
         );
       },
       DotTuple: (node, accept, typir) => {
+        if (containsNodeType(node.expr, "Panic")) {
+          accept({
+            severity: "error",
+            code: "ERROR_AMBIGUOUS_PANIC_TYPE",
+            message: "cannot infer type for panic before tuple projection",
+            languageNode: node.expr,
+          });
+          return;
+        }
+
+        if (isVar(node.expr) && node.expr.ref.ref?.$type === "DeclFun") {
+          accept({
+            severity: "error",
+            code: "ERROR_NOT_A_TUPLE",
+            message: "Pair projection expects a pair, but the expression is a function.",
+            languageNode: node,
+            languageProperty: "expr",
+          });
+          return;
+        }
+
         if (node.index < 1) {
           accept({
             severity: "error",
@@ -1930,6 +2785,7 @@ export class StellaTypeSystem
             : "unknown";
           accept({
             severity: "error",
+            code: "ERROR_NOT_A_TUPLE",
             message: `Pair projection expects a pair, but the expression has type ${actual}`,
             languageNode: node,
             languageProperty: "expr",
@@ -1965,6 +2821,7 @@ export class StellaTypeSystem
           const actual = recordType ? userRepr(recordType) : "unknown";
           accept({
             severity: "error",
+            code: "ERROR_NOT_A_RECORD",
             message: `Record projection expects a record, but the expression has type ${actual}.`,
             languageNode: node,
             languageProperty: "expr",
@@ -2095,10 +2952,11 @@ export class StellaTypeSystem
       },
       List: (node, accept, typir) => {
         if (node.exprs.length === 0) {
-          const expected = getExpectedListType(node, typir, listTypeLookup);
+          const expected = getExpectedListType(node, typeContext);
           if (!expected) {
             accept({
               severity: "error",
+              code: "ERROR_AMBIGUOUS_LIST_TYPE",
               message:
                 "Cannot infer the element type of an empty list. Add an annotation like '[] as [T]'.",
               languageNode: node,
@@ -2114,6 +2972,24 @@ export class StellaTypeSystem
             return;
           }
           elementTypes.push(exprType);
+        }
+
+        const expectedListType = getExpectedListType(node, typeContext);
+        const expectedElementType = expectedListType
+          ? listTypeLookup.get(expectedListType)
+          : undefined;
+        if (expectedElementType) {
+          for (const expr of node.exprs) {
+            typir.validation.Constraints.ensureNodeIsAssignable(
+              expr,
+              expectedElementType,
+              accept,
+              (actual, expected) => ({
+                code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
+                message: `List element must have type ${userRepr(expected)}, but has ${userRepr(actual)}.`,
+              })
+            );
+          }
         }
 
         const reference = elementTypes[0];
@@ -2150,11 +3026,21 @@ export class StellaTypeSystem
           return;
         }
 
+        const headType = typir.Inference.inferType(node.head);
+        const headReferenceType =
+          !Array.isArray(headType) && headType
+            ? referenceTypeLookup.get(headType)
+            : undefined;
+        if (headReferenceType && areTypesEqual(headReferenceType, elementType)) {
+          return;
+        }
+
         typir.validation.Constraints.ensureNodeIsAssignable(
           node.head,
           elementType,
           accept,
           (actual, expected) => ({
+            code: "ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION",
             message: `'cons' head must have type ${userRepr(expected)}, but has ${userRepr(actual)}.`,
           })
         );
@@ -2209,15 +3095,42 @@ export class StellaTypeSystem
         }
       },
       Inl: (node, accept, typir) => {
-        const expectedSum = getExpectedSumType(
-          node,
-          typir,
-          sumTypeLookup,
-          tupleTypeLookup
-        );
+        const directExpected = findDirectExpectedType(node, typeContext);
+        if (
+          directExpected &&
+          !Array.isArray(directExpected) &&
+          !sumTypeLookup.has(directExpected)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_UNEXPECTED_INJECTION",
+            message: `This expression is expected to have type ${userRepr(directExpected)}, but it is an 'inl' sum injection.`,
+            languageNode: node,
+          });
+        }
+
+        const expectedSum = getExpectedSumType(node, typeContext);
+        if (
+          expectedSum &&
+          hasApplicationFunctionAncestor(node) &&
+          !hasExtension(node, Extensions.TypeReconstruction) &&
+          !hasExtension(node, Extensions.AmbiguousTypeAsBottom) &&
+          !findNonInferenceDrivenExpectedType(node, typeContext)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_AMBIGUOUS_SUM_TYPE",
+            message:
+              "It is not possible to output the amount type for 'inl'. Add an annotation of the form 'as <T + U>' or use it in the context of the expected type.",
+            languageNode: node,
+          });
+          return;
+        }
+
         if (!expectedSum || Array.isArray(expectedSum)) {
           accept({
             severity: "error",
+            code: "ERROR_AMBIGUOUS_SUM_TYPE",
             message:
               "It is not possible to output the amount type for 'inl'. Add an annotation of the form 'as <T + U>' or use it in the context of the expected type.",
             languageNode: node,
@@ -2241,15 +3154,42 @@ export class StellaTypeSystem
         );
       },
       Inr: (node, accept, typir) => {
-        const expectedSum = getExpectedSumType(
-          node,
-          typir,
-          sumTypeLookup,
-          tupleTypeLookup
-        );
+        const directExpected = findDirectExpectedType(node, typeContext);
+        if (
+          directExpected &&
+          !Array.isArray(directExpected) &&
+          !sumTypeLookup.has(directExpected)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_UNEXPECTED_INJECTION",
+            message: `This expression is expected to have type ${userRepr(directExpected)}, but it is an 'inr' sum injection.`,
+            languageNode: node,
+          });
+        }
+
+        const expectedSum = getExpectedSumType(node, typeContext);
+        if (
+          expectedSum &&
+          hasApplicationFunctionAncestor(node) &&
+          !hasExtension(node, Extensions.TypeReconstruction) &&
+          !hasExtension(node, Extensions.AmbiguousTypeAsBottom) &&
+          !findNonInferenceDrivenExpectedType(node, typeContext)
+        ) {
+          accept({
+            severity: "error",
+            code: "ERROR_AMBIGUOUS_SUM_TYPE",
+            message:
+              "It is not possible to output the amount type for 'inr'. Add an annotation of the form 'as <T + U>' or use it in the context of the expected type.",
+            languageNode: node,
+          });
+          return;
+        }
+
         if (!expectedSum || Array.isArray(expectedSum)) {
           accept({
             severity: "error",
+            code: "ERROR_AMBIGUOUS_SUM_TYPE",
             message:
               "It is not possible to output the amount type for 'inr'. Add an annotation of the form 'as <T + U>' or use it in the context of the expected type.",
             languageNode: node,
@@ -2382,20 +3322,21 @@ export class StellaTypeSystem
 
         if (branchTypes.length === node.cases.length) {
           const reference = branchTypes[0];
-          const expectedType = findExpectedType(node, typir);
+          const expectedType = findExpectedType(node, typeContext);
           for (const branchType of branchTypes.slice(1)) {
             if (
               !getCompatibleExpressionType(
                 reference,
                 branchType,
                 typeBottom,
-                areTypesEqual
+                areTypesEqual,
+                isKnownAssignable
               )
             ) {
               if (
                 expectedType &&
                 branchTypes.every((type) =>
-                  typir.Assignability.isAssignable(type, expectedType)
+                  isKnownAssignable(type, expectedType)
                 )
               ) {
                 break;
@@ -2500,10 +3441,224 @@ export class StellaTypeSystem
   }
 }
 
+function isStructurallyAssignable(
+  source: TypirType,
+  target: TypirType,
+  context: StellaTypeContext,
+  seen = new Set<string>()
+): boolean {
+  if (context.areTypesEqual(source, target)) {
+    return true;
+  }
+  if (source === context.typeBottom || target === context.typeTop) {
+    return true;
+  }
+
+  if (context.typeVariableLookup.has(source) || context.typeVariableLookup.has(target)) {
+    return source === target;
+  }
+
+  const key = `${source.getIdentifier()}<=${target.getIdentifier()}`;
+  if (seen.has(key)) {
+    return true;
+  }
+  seen.add(key);
+
+  const sourceForall = context.forallTypeLookup.get(source);
+  const targetForall = context.forallTypeLookup.get(target);
+  if (sourceForall || targetForall) {
+    if (
+      !sourceForall ||
+      !targetForall ||
+      sourceForall.params.length !== targetForall.params.length
+    ) {
+      return false;
+    }
+
+    const substitutions = new Map<TypirType, TypirType>();
+    for (let index = 0; index < sourceForall.params.length; index++) {
+      substitutions.set(targetForall.params[index], sourceForall.params[index]);
+    }
+    return isStructurallyAssignable(
+      sourceForall.body,
+      context.substituteType(targetForall.body, substitutions),
+      context,
+      seen
+    );
+  }
+
+  const sourceTuple = context.tupleTypeLookup.get(source);
+  const targetTuple = context.tupleTypeLookup.get(target);
+  if (sourceTuple && targetTuple) {
+    return (
+      sourceTuple.length === targetTuple.length &&
+      sourceTuple.every((component, index) =>
+        isStructurallyAssignable(component, targetTuple[index], context, seen)
+      )
+    );
+  }
+
+  const sourceSum = context.sumTypeLookup.get(source);
+  const targetSum = context.sumTypeLookup.get(target);
+  if (sourceSum && targetSum) {
+    return (
+      isStructurallyAssignable(sourceSum[0], targetSum[0], context, seen) &&
+      isStructurallyAssignable(sourceSum[1], targetSum[1], context, seen)
+    );
+  }
+
+  const sourceRecord = context.recordTypeLookup.get(source);
+  const targetRecord = context.recordTypeLookup.get(target);
+  if (sourceRecord && targetRecord) {
+    return [...targetRecord.entries()].every(([label, targetField]) => {
+      const sourceField = sourceRecord.get(label);
+      return (
+        sourceField !== undefined &&
+        isStructurallyAssignable(sourceField, targetField, context, seen)
+      );
+    });
+  }
+
+  const sourceVariant = context.variantTypeLookup.get(source);
+  const targetVariant = context.variantTypeLookup.get(target);
+  if (sourceVariant && targetVariant) {
+    return [...sourceVariant.entries()].every(([label, sourcePayload]) => {
+      if (!targetVariant.has(label)) {
+        return false;
+      }
+      const targetPayload = targetVariant.get(label);
+      if (sourcePayload === undefined || targetPayload === undefined) {
+        return sourcePayload === targetPayload;
+      }
+      return isStructurallyAssignable(
+        sourcePayload,
+        targetPayload,
+        context,
+        seen
+      );
+    });
+  }
+
+  const sourceList = context.listTypeLookup.get(source);
+  const targetList = context.listTypeLookup.get(target);
+  if (sourceList && targetList) {
+    return isStructurallyAssignable(sourceList, targetList, context, seen);
+  }
+
+  const sourceReference = context.referenceTypeLookup.get(source);
+  const targetReference = context.referenceTypeLookup.get(target);
+  if (sourceReference && targetReference) {
+    return (
+      isStructurallyAssignable(sourceReference, targetReference, context, seen) &&
+      isStructurallyAssignable(targetReference, sourceReference, context, seen)
+    );
+  }
+
+  if (isFunctionType(source) && isFunctionType(target)) {
+    const sourceInputs = source.getInputs();
+    const targetInputs = target.getInputs();
+    const sourceOutput = source.getOutput("RETURN_UNDEFINED")?.type;
+    const targetOutput = target.getOutput("RETURN_UNDEFINED")?.type;
+    if (
+      sourceInputs.length !== targetInputs.length ||
+      !sourceOutput ||
+      !targetOutput
+    ) {
+      return false;
+    }
+
+    return (
+      isStructurallyAssignable(
+        context.typir.infrastructure.TypeResolver.resolve(sourceOutput),
+        context.typir.infrastructure.TypeResolver.resolve(targetOutput),
+        context,
+        seen
+      ) &&
+      sourceInputs.every((sourceInput, index) =>
+        isStructurallyAssignable(
+          context.typir.infrastructure.TypeResolver.resolve(
+            targetInputs[index].type
+          ),
+          context.typir.infrastructure.TypeResolver.resolve(sourceInput.type),
+          context,
+          seen
+        )
+      )
+    );
+  }
+
+  return false;
+}
+
+function areRecordsExactlyCompatible(
+  actual: Map<string, TypirType>,
+  expected: Map<string, TypirType>,
+  areTypesEqual: (left: TypirType, right: TypirType) => boolean
+): boolean {
+  if (actual.size !== expected.size) {
+    return false;
+  }
+
+  for (const [label, expectedType] of expected) {
+    const actualType = actual.get(label);
+    if (!actualType || !areTypesEqual(actualType, expectedType)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function findExpectedType(
   node: AstNode,
-  typir: TypirServices<StellaSpecifics>
+  context: StellaTypeContext
 ): TypirType | undefined {
+  return resolveExpectedType(node, context, "full");
+}
+
+function findNonInferenceDrivenExpectedType(
+  node: AstNode,
+  context: StellaTypeContext
+): TypirType | undefined {
+  return resolveExpectedType(node, context, "nonInferenceDriven");
+}
+
+function findContainerExpectedType(
+  node: AstNode,
+  context: StellaTypeContext
+): TypirType | undefined {
+  return resolveExpectedType(node, context, "container");
+}
+
+function findDirectExpectedType(
+  node: AstNode,
+  context: StellaTypeContext
+): TypirType | undefined {
+  return resolveExpectedType(node, context, "direct");
+}
+
+function resolveExpectedType(
+  node: AstNode,
+  context: StellaTypeContext,
+  mode: ExpectedTypeMode
+): TypirType | undefined {
+  switch (mode) {
+    case "full":
+      return resolveFullExpectedType(node, context);
+    case "nonInferenceDriven":
+      return resolveNonInferenceDrivenExpectedType(node, context);
+    case "container":
+      return resolveContainerExpectedType(node, context);
+    case "direct":
+      return resolveDirectExpectedType(node, context);
+  }
+}
+
+function resolveFullExpectedType(
+  node: AstNode,
+  context: StellaTypeContext
+): TypirType | undefined {
+  const typir = context.typir;
   let current: AstNode | undefined = node;
   let container = node.$container as AstNode | undefined;
   if (!container) {
@@ -2537,7 +3692,7 @@ function findExpectedType(
         "Abstraction" &&
       (container as { returnExpr?: unknown }).returnExpr === current
     ) {
-      const expectedAbstraction = findExpectedType(container, typir);
+      const expectedAbstraction = findExpectedType(container, context);
       if (
         expectedAbstraction &&
         !Array.isArray(expectedAbstraction) &&
@@ -2551,8 +3706,100 @@ function findExpectedType(
       }
     }
 
+    if ((container as { $type?: string; rhs?: unknown }).$type === "Binding") {
+      const binding = container as unknown as {
+        name: string;
+        rhs: AstNode;
+        $container?: AstNode;
+      };
+      if (binding.rhs === current && binding.$container?.$type === "Record") {
+        const expectedRecord = findExpectedType(binding.$container, context);
+        if (expectedRecord && !Array.isArray(expectedRecord)) {
+          const expectedFields = context.recordTypeLookup.get(expectedRecord);
+          const expectedField = expectedFields?.get(binding.name);
+          if (expectedField) {
+            return expectedField;
+          }
+        }
+      }
+    }
+
+    if (container.$type === "Tuple") {
+      const tuple = container as unknown as { exprs: AstNode[] };
+      const index = tuple.exprs.indexOf(current as never);
+      if (index >= 0) {
+        const expectedTuple = findExpectedType(container, context);
+        const expectedComponents = expectedTuple
+          ? context.tupleTypeLookup.get(expectedTuple)
+          : undefined;
+        if (expectedComponents && index < expectedComponents.length) {
+          return expectedComponents[index];
+        }
+      }
+    }
+
+    if (container.$type === "List") {
+      const list = container as unknown as { exprs: AstNode[] };
+      if (list.exprs.includes(current as never)) {
+        const expectedList = findExpectedType(container, context);
+        const elementType = expectedList
+          ? context.listTypeLookup.get(expectedList)
+          : undefined;
+        if (elementType) {
+          return elementType;
+        }
+      }
+    }
+
+    if (container.$type === "ConsList") {
+      const cons = container as unknown as { head: AstNode; tail: AstNode };
+      if (cons.head === current) {
+        const tailType = typir.Inference.inferType(cons.tail);
+        const tailElementType =
+          !Array.isArray(tailType) && tailType
+            ? context.listTypeLookup.get(tailType)
+            : undefined;
+        if (tailElementType) {
+          return tailElementType;
+        }
+
+        const expectedList = findExpectedType(container, context);
+        const expectedElement = expectedList
+          ? context.listTypeLookup.get(expectedList)
+          : undefined;
+        if (expectedElement) {
+          return expectedElement;
+        }
+      } else if (cons.tail === current) {
+        const expectedList = findExpectedType(container, context);
+        if (expectedList) {
+          return expectedList;
+        }
+      }
+    }
+
+    if ((container as { $type?: string; rhs?: unknown }).$type === "Variant") {
+      const variant = container as unknown as {
+        label: string;
+        rhs?: AstNode;
+      };
+      if (variant.rhs === current) {
+        const expectedVariant = findExpectedType(container, context);
+        const expectedFields = expectedVariant
+          ? context.variantTypeLookup.get(expectedVariant)
+          : undefined;
+        const expectedPayload = expectedFields?.get(variant.label);
+        if (expectedPayload) {
+          return expectedPayload;
+        }
+      }
+    }
+
     if (container.$type === Application.$type) {
       const application = container as Application;
+      if (application.fun === current) {
+        return undefined;
+      }
       const argIndex = application.args.indexOf(current as never);
       if (argIndex >= 0) {
         const referencedFunction = getDirectReferencedFunction(application.fun);
@@ -2574,10 +3821,24 @@ function findExpectedType(
       }
     }
 
+    if (
+      container.$type === "DotRecord" &&
+      (container as { expr?: AstNode }).expr === current
+    ) {
+      return undefined;
+    }
+
+    if (
+      container.$type === "DotTuple" &&
+      (container as { expr?: AstNode }).expr === current
+    ) {
+      return undefined;
+    }
+
     if ((container as MatchCase).expr === current) {
       const matchNode = (container as MatchCase).$container as Match | undefined;
       if (matchNode) {
-        const expected = findExpectedType(matchNode, typir);
+        const expected = findContainerExpectedType(matchNode, context);
         if (expected) {
           return expected;
         }
@@ -2593,22 +3854,203 @@ function findExpectedType(
         elseExpr: AstNode;
       };
       if (ifNode.thenExpr === current || ifNode.elseExpr === current) {
+        const expected = findContainerExpectedType(container, context);
+        if (expected) {
+          return expected;
+        }
+
         const sibling =
           ifNode.thenExpr === current ? ifNode.elseExpr : ifNode.thenExpr;
         const siblingType = typir.Inference.inferType(sibling);
         if (!Array.isArray(siblingType) && siblingType) {
           return siblingType;
         }
-
-        const expected = findExpectedType(container, typir);
-        if (expected) {
-          return expected;
-        }
       }
     }
 
     current = container;
     container = container.$container as AstNode | undefined;
+  }
+
+  return undefined;
+}
+
+function resolveNonInferenceDrivenExpectedType(
+  node: AstNode,
+  context: StellaTypeContext
+): TypirType | undefined {
+  const typir = context.typir;
+  let current: AstNode | undefined = node;
+  let container = node.$container as AstNode | undefined;
+
+  while (container) {
+    if ((container as { $type?: string; expr?: unknown }).$type === "TypeAsc") {
+      const typeAsc = container as { type?: AstNode; expr?: AstNode };
+      if (typeAsc.expr === current && typeAsc.type) {
+        const expected = typir.Inference.inferType(typeAsc.type);
+        if (!Array.isArray(expected) && expected) {
+          return expected;
+        }
+      }
+    }
+
+    if (
+      isDeclFun(container) &&
+      container.returnExpr === current &&
+      container.returnType
+    ) {
+      const expected = typir.Inference.inferType(container.returnType);
+      if (!Array.isArray(expected) && expected) {
+        return expected;
+      }
+    }
+
+    if ((container as { $type?: string; rhs?: unknown }).$type === "Binding") {
+      const binding = container as unknown as {
+        name: string;
+        rhs: AstNode;
+        $container?: AstNode;
+      };
+      if (binding.rhs === current && binding.$container?.$type === "Record") {
+        const expectedRecord = findNonInferenceDrivenExpectedType(
+          binding.$container,
+          context
+        );
+        if (expectedRecord) {
+          const expectedFields = context.recordTypeLookup.get(expectedRecord);
+          const expectedField = expectedFields?.get(binding.name);
+          if (expectedField) {
+            return expectedField;
+          }
+        }
+      }
+    }
+
+    if (container.$type === Application.$type) {
+      const application = container as Application;
+      if (application.fun === current) {
+        return undefined;
+      }
+      const argIndex = application.args.indexOf(current as never);
+      if (argIndex >= 0) {
+        const referencedFunction = getDirectReferencedFunction(application.fun);
+        const directTypeNode = referencedFunction?.paramDecls[argIndex]?.paramType;
+        if (directTypeNode) {
+          const directType = typir.Inference.inferType(directTypeNode);
+          if (!Array.isArray(directType) && directType) {
+            return directType;
+          }
+        }
+      }
+    }
+
+    if (
+      (container as { $type?: string; returnExpr?: unknown }).$type === "Abstraction" &&
+      (container as { returnExpr?: unknown }).returnExpr === current
+    ) {
+      return undefined;
+    }
+
+    current = container;
+    container = container.$container as AstNode | undefined;
+  }
+
+  return undefined;
+}
+
+function resolveContainerExpectedType(
+  node: AstNode,
+  context: StellaTypeContext
+): TypirType | undefined {
+  const typir = context.typir;
+  const container = node.$container as AstNode | undefined;
+  if (!container) {
+    return undefined;
+  }
+
+  if ((container as { $type?: string; expr?: unknown }).$type === "TypeAsc") {
+    const typeAsc = container as { type?: AstNode; expr?: AstNode };
+    if (typeAsc.expr === node && typeAsc.type) {
+      const expected = typir.Inference.inferType(typeAsc.type);
+      return !Array.isArray(expected) && expected ? expected : undefined;
+    }
+  }
+
+  if (
+    isDeclFun(container) &&
+    container.returnExpr === node &&
+    container.returnType
+  ) {
+    const expected = typir.Inference.inferType(container.returnType);
+    return !Array.isArray(expected) && expected ? expected : undefined;
+  }
+
+  if ((container as { $type?: string; returnExpr?: unknown }).$type === "Abstraction") {
+    const abstraction = container as unknown as { returnExpr?: AstNode };
+    if (abstraction.returnExpr === node) {
+      const expectedFunction = findContainerExpectedType(container, context);
+      if (expectedFunction && isFunctionType(expectedFunction)) {
+        const output = expectedFunction.getOutput("RETURN_UNDEFINED")?.type;
+        return output ? typir.infrastructure.TypeResolver.resolve(output) : undefined;
+      }
+    }
+  }
+
+  if (container.$type === Application.$type) {
+    const application = container as Application;
+    const argIndex = application.args.indexOf(node as never);
+    if (argIndex >= 0) {
+      const referencedFunction = getDirectReferencedFunction(application.fun);
+      const directTypeNode = referencedFunction?.paramDecls[argIndex]?.paramType;
+      if (directTypeNode) {
+        const directType = typir.Inference.inferType(directTypeNode);
+        if (!Array.isArray(directType) && directType) {
+          return directType;
+        }
+      }
+
+      const functionType = getCallableType(application.fun, typir);
+      if (functionType && isFunctionType(functionType)) {
+        const expectedInput = functionType.getInputs()[argIndex];
+        if (expectedInput) {
+          return typir.infrastructure.TypeResolver.resolve(expectedInput.type);
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function resolveDirectExpectedType(
+  node: AstNode,
+  context: StellaTypeContext
+): TypirType | undefined {
+  const typir = context.typir;
+  const container = node.$container as AstNode | undefined;
+  if (!container) {
+    return undefined;
+  }
+
+  if ((container as { $type?: string; expr?: unknown }).$type === "TypeAsc") {
+    const typeAsc = container as { type?: AstNode; expr?: AstNode };
+    if (typeAsc.expr === node && typeAsc.type) {
+      const expected = typir.Inference.inferType(typeAsc.type);
+      if (!Array.isArray(expected) && expected) {
+        return expected;
+      }
+    }
+  }
+
+  if (
+    isDeclFun(container) &&
+    container.returnExpr === node &&
+    container.returnType
+  ) {
+    const expected = typir.Inference.inferType(container.returnType);
+    if (!Array.isArray(expected) && expected) {
+      return expected;
+    }
   }
 
   return undefined;
@@ -2630,12 +4072,138 @@ function getCallableType(
   return !Array.isArray(inferred) && inferred ? inferred : undefined;
 }
 
+function unwrapParenthesisedExpr(node: AstNode): AstNode {
+  let current = node;
+  while (
+    current.$type === "ParenthesisedExpr" &&
+    (current as { expr?: AstNode }).expr
+  ) {
+    current = (current as unknown as { expr: AstNode }).expr;
+  }
+  return current;
+}
+
+function containsNodeType(
+  node: AstNode,
+  typeName: string,
+  seen = new Set<AstNode>()
+): boolean {
+  if (node.$type === typeName) {
+    return true;
+  }
+
+  if (seen.has(node)) {
+    return false;
+  }
+  seen.add(node);
+
+  for (const [key, value] of Object.entries(
+    node as unknown as Record<string, unknown>
+  )) {
+    if (key.startsWith("$")) {
+      continue;
+    }
+
+    if (!value) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      if (
+        value.some(
+          (item) =>
+            typeof item === "object" &&
+            item !== null &&
+            "$type" in item &&
+            containsNodeType(item as AstNode, typeName, seen)
+        )
+      ) {
+        return true;
+      }
+    } else if (
+      typeof value === "object" &&
+      "$type" in value &&
+      containsNodeType(value as AstNode, typeName, seen)
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function hasAncestor(node: AstNode, typeName: string): boolean {
+  let current = node.$container as AstNode | undefined;
+  while (current) {
+    if (current.$type === typeName) {
+      return true;
+    }
+    current = current.$container as AstNode | undefined;
+  }
+
+  return false;
+}
+
+function hasApplicationFunctionAncestor(node: AstNode): boolean {
+  let current: AstNode | undefined = node;
+  let container = node.$container as AstNode | undefined;
+
+  while (container) {
+    if (
+      container.$type === Application.$type &&
+      (container as Application).fun === current
+    ) {
+      return true;
+    }
+
+    current = container;
+    container = container.$container as AstNode | undefined;
+  }
+
+  return false;
+}
+
+function hasTypeConstrainingContext(node: AstNode): boolean {
+  let current: AstNode | undefined = node;
+  let container = node.$container as AstNode | undefined;
+
+  while (container) {
+    if (
+      container.$type === "Application" ||
+      container.$type === "DotTuple" ||
+      container.$type === "DotRecord"
+    ) {
+      return true;
+    }
+
+    if (
+      container.$type === "If" &&
+      ((container as { thenExpr?: AstNode }).thenExpr === current ||
+        (container as { elseExpr?: AstNode }).elseExpr === current)
+    ) {
+      current = container;
+      container = container.$container as AstNode | undefined;
+      continue;
+    }
+
+    if (container.$type === "ParenthesisedExpr") {
+      current = container;
+      container = container.$container as AstNode | undefined;
+      continue;
+    }
+
+    return false;
+  }
+
+  return false;
+}
+
 function getDirectReferencedFunction(
   node: AstNode
 ):
   | (AstNode & {
-      $type: "DeclFun" | "DeclFunGeneric";
+      $type: "DeclFun";
       paramDecls: Array<{ paramType: AstNode }>;
+      returnType?: AstNode;
     })
   | undefined {
   if (!isVar(node)) {
@@ -2643,13 +4211,11 @@ function getDirectReferencedFunction(
   }
 
   const referenced = node.ref.ref as AstNode | undefined;
-  if (
-    referenced &&
-    (referenced.$type === "DeclFun" || referenced.$type === "DeclFunGeneric")
-  ) {
+  if (referenced && referenced.$type === "DeclFun") {
     return referenced as AstNode & {
-      $type: "DeclFun" | "DeclFunGeneric";
+      $type: "DeclFun";
       paramDecls: Array<{ paramType: AstNode }>;
+      returnType?: AstNode;
     };
   }
 
@@ -2658,12 +4224,10 @@ function getDirectReferencedFunction(
 
 function getExpectedSumType(
   node: Inl | Inr,
-  typir: TypirServices<StellaSpecifics>,
-  sumTypeLookup: Map<TypirType, [TypirType, TypirType]>,
-  tupleTypeLookup: Map<TypirType, TypirType[]>
+  context: StellaTypeContext
 ): TypirType | undefined {
-  const expected = findExpectedType(node, typir);
-  if (expected && sumTypeLookup.has(expected)) {
+  const expected = findExpectedType(node, context);
+  if (expected && context.sumTypeLookup.has(expected)) {
     return expected;
   }
 
@@ -2678,14 +4242,12 @@ function getExpectedSumType(
   ) {
     const outerExpected = getExpectedSumType(
       container as Inl | Inr,
-      typir,
-      sumTypeLookup,
-      tupleTypeLookup
+      context
     );
     if (!outerExpected) {
       return undefined;
     }
-    const outerComponents = sumTypeLookup.get(outerExpected);
+    const outerComponents = context.sumTypeLookup.get(outerExpected);
     if (!outerComponents) {
       return undefined;
     }
@@ -2696,9 +4258,9 @@ function getExpectedSumType(
     const tuple = container as unknown as { exprs: AstNode[] };
     const index = tuple.exprs.indexOf(node as never);
     if (index >= 0) {
-      const tupleExpected = findExpectedType(container, typir);
+      const tupleExpected = findExpectedType(container, context);
       if (tupleExpected) {
-        const components = tupleTypeLookup.get(tupleExpected);
+        const components = context.tupleTypeLookup.get(tupleExpected);
         if (components && index < components.length) {
           return components[index];
         }
@@ -2711,34 +4273,41 @@ function getExpectedSumType(
 
 function getExpectedListType(
   node: List,
-  typir: TypirServices<StellaSpecifics>,
-  listTypeLookup: Map<TypirType, TypirType>
+  context: StellaTypeContext
 ): TypirType | undefined {
-  const expected = findExpectedType(node, typir);
-  return expected && listTypeLookup.has(expected) ? expected : undefined;
+  const expected = findExpectedType(node, context);
+  return expected && context.listTypeLookup.has(expected) ? expected : undefined;
 }
 
 function getExpectedRecordType(
   node: StellaRecord,
-  typir: TypirServices<StellaSpecifics>,
-  recordTypeLookup: Map<TypirType, Map<string, TypirType>>
+  context: StellaTypeContext
 ): TypirType | undefined {
-  const expected = findExpectedType(node, typir);
-  return expected && recordTypeLookup.has(expected) ? expected : undefined;
+  const expected = findExpectedType(node, context);
+  return expected && context.recordTypeLookup.has(expected)
+    ? expected
+    : undefined;
 }
 
 function getExpectedReferenceType(
   node: ConstMemory,
-  typir: TypirServices<StellaSpecifics>,
-  referenceTypeLookup: Map<TypirType, TypirType>
+  context: StellaTypeContext
 ): TypirType | undefined {
-  const expected = findExpectedType(node, typir);
-  if (expected && referenceTypeLookup.has(expected)) {
+  const typir = context.typir;
+  const immediateContainer = node.$container as AstNode | undefined;
+  const isImmediateIfBranch =
+    immediateContainer?.$type === "If" &&
+    ((immediateContainer as { thenExpr?: AstNode }).thenExpr === node ||
+      (immediateContainer as { elseExpr?: AstNode }).elseExpr === node);
+  const expected = isImmediateIfBranch
+    ? undefined
+    : findExpectedType(node, context);
+  if (expected && context.referenceTypeLookup.has(expected)) {
     return expected;
   }
 
   let current: AstNode | undefined = node;
-  let container = node.$container as AstNode | undefined;
+  let container = immediateContainer;
   if (!container) return undefined;
 
   while (container) {
@@ -2747,7 +4316,7 @@ function getExpectedReferenceType(
       const typeAsc = container as { type?: unknown; expr?: unknown };
       if (typeAsc.expr === current && typeAsc.type) {
         const expected = typir.Inference.inferType(typeAsc.type as AstNode);
-        if (!Array.isArray(expected) && referenceTypeLookup.has(expected)) {
+        if (!Array.isArray(expected) && context.referenceTypeLookup.has(expected)) {
           return expected;
         }
       }
@@ -2760,7 +4329,7 @@ function getExpectedReferenceType(
       container.returnType
     ) {
       const expected = typir.Inference.inferType(container.returnType);
-      if (!Array.isArray(expected) && referenceTypeLookup.has(expected)) {
+      if (!Array.isArray(expected) && context.referenceTypeLookup.has(expected)) {
         return expected;
       }
     }
@@ -2775,7 +4344,10 @@ function getExpectedReferenceType(
           const expectedTypeNode = declaration?.paramDecls[argIndex]?.paramType;
           if (expectedTypeNode) {
             const expected = typir.Inference.inferType(expectedTypeNode);
-            if (!Array.isArray(expected) && referenceTypeLookup.has(expected)) {
+            if (
+              !Array.isArray(expected) &&
+              context.referenceTypeLookup.has(expected)
+            ) {
               return expected;
             }
           }
@@ -2792,7 +4364,7 @@ function getExpectedReferenceType(
             const expected = typir.infrastructure.TypeResolver.resolve(
               expectedInput.type
             );
-            if (referenceTypeLookup.has(expected)) {
+            if (context.referenceTypeLookup.has(expected)) {
               return expected;
             }
           }
@@ -2847,11 +4419,46 @@ function hasExceptionVariantDeclarations(node: AstNode): boolean {
   return !!program.decls?.some((decl) => decl.$type === "DeclExceptionVariant");
 }
 
+function getDeclaredExceptionVariantPayloadType(
+  node: AstNode,
+  label: string,
+  typir: TypirServices<StellaSpecifics>
+): TypirType | undefined {
+  let root: AstNode = node;
+  while (root.$container) {
+    root = root.$container as AstNode;
+  }
+
+  const program = root as { decls?: AstNode[] };
+  if (!program.decls) {
+    return undefined;
+  }
+
+  for (const decl of program.decls) {
+    if (
+      decl.$type !== "DeclExceptionVariant" ||
+      (decl as unknown as { name?: string }).name !== label
+    ) {
+      continue;
+    }
+
+    const variantTypeNode = (decl as unknown as { variantType: AstNode })
+      .variantType;
+    const variantType = typir.Inference.inferType(variantTypeNode);
+    if (!Array.isArray(variantType) && variantType) {
+      return variantType;
+    }
+  }
+
+  return undefined;
+}
+
 function getCompatibleExpressionType(
   left: TypirType,
   right: TypirType,
   bottom: TypirType,
-  areTypesEqual: (left: TypirType, right: TypirType) => boolean
+  areTypesEqual: (left: TypirType, right: TypirType) => boolean,
+  isAssignable?: (left: TypirType, right: TypirType) => boolean
 ): TypirType | undefined {
   if (areTypesEqual(left, right)) {
     return left;
@@ -2865,54 +4472,53 @@ function getCompatibleExpressionType(
     return left;
   }
 
+  if (isAssignable?.(left, right)) {
+    return right;
+  }
+
+  if (isAssignable?.(right, left)) {
+    return left;
+  }
+
   return undefined;
 }
 
 function isTypeCompatibleWithAuto(
   actual: TypirType,
   expected: TypirType,
-  helpers: {
-    typeAuto: TypirType;
-    areTypesEqual: (left: TypirType, right: TypirType) => boolean;
-    tupleTypeLookup: Map<TypirType, TypirType[]>;
-    sumTypeLookup: Map<TypirType, [TypirType, TypirType]>;
-    recordTypeLookup: Map<TypirType, Map<string, TypirType>>;
-    variantTypeLookup: Map<TypirType, Map<string, TypirType | undefined>>;
-    listTypeLookup: Map<TypirType, TypirType>;
-    referenceTypeLookup: Map<TypirType, TypirType>;
-  },
-  typir: TypirServices<StellaSpecifics>
+  context: StellaTypeContext
 ): boolean {
+  const typir = context.typir;
   if (
-    actual === helpers.typeAuto ||
-    expected === helpers.typeAuto ||
-    helpers.areTypesEqual(actual, expected)
+    actual === context.typeAuto ||
+    expected === context.typeAuto ||
+    context.areTypesEqual(actual, expected)
   ) {
     return true;
   }
 
-  const actualTuple = helpers.tupleTypeLookup.get(actual);
-  const expectedTuple = helpers.tupleTypeLookup.get(expected);
+  const actualTuple = context.tupleTypeLookup.get(actual);
+  const expectedTuple = context.tupleTypeLookup.get(expected);
   if (actualTuple && expectedTuple) {
     return (
       actualTuple.length === expectedTuple.length &&
       actualTuple.every((type, index) =>
-        isTypeCompatibleWithAuto(type, expectedTuple[index], helpers, typir)
+        isTypeCompatibleWithAuto(type, expectedTuple[index], context)
       )
     );
   }
 
-  const actualSum = helpers.sumTypeLookup.get(actual);
-  const expectedSum = helpers.sumTypeLookup.get(expected);
+  const actualSum = context.sumTypeLookup.get(actual);
+  const expectedSum = context.sumTypeLookup.get(expected);
   if (actualSum && expectedSum) {
     return (
-      isTypeCompatibleWithAuto(actualSum[0], expectedSum[0], helpers, typir) &&
-      isTypeCompatibleWithAuto(actualSum[1], expectedSum[1], helpers, typir)
+      isTypeCompatibleWithAuto(actualSum[0], expectedSum[0], context) &&
+      isTypeCompatibleWithAuto(actualSum[1], expectedSum[1], context)
     );
   }
 
-  const actualRecord = helpers.recordTypeLookup.get(actual);
-  const expectedRecord = helpers.recordTypeLookup.get(expected);
+  const actualRecord = context.recordTypeLookup.get(actual);
+  const expectedRecord = context.recordTypeLookup.get(expected);
   if (actualRecord && expectedRecord) {
     if (actualRecord.size !== expectedRecord.size) {
       return false;
@@ -2921,7 +4527,7 @@ function isTypeCompatibleWithAuto(
       const actualType = actualRecord.get(label);
       if (
         !actualType ||
-        !isTypeCompatibleWithAuto(actualType, expectedType, helpers, typir)
+        !isTypeCompatibleWithAuto(actualType, expectedType, context)
       ) {
         return false;
       }
@@ -2929,8 +4535,8 @@ function isTypeCompatibleWithAuto(
     return true;
   }
 
-  const actualVariant = helpers.variantTypeLookup.get(actual);
-  const expectedVariant = helpers.variantTypeLookup.get(expected);
+  const actualVariant = context.variantTypeLookup.get(actual);
+  const expectedVariant = context.variantTypeLookup.get(expected);
   if (actualVariant && expectedVariant) {
     if (actualVariant.size !== expectedVariant.size) {
       return false;
@@ -2944,7 +4550,7 @@ function isTypeCompatibleWithAuto(
         actualType === undefined ||
         expectedType === undefined
           ? actualType !== expectedType
-          : !isTypeCompatibleWithAuto(actualType, expectedType, helpers, typir)
+          : !isTypeCompatibleWithAuto(actualType, expectedType, context)
       ) {
         return false;
       }
@@ -2952,16 +4558,16 @@ function isTypeCompatibleWithAuto(
     return true;
   }
 
-  const actualList = helpers.listTypeLookup.get(actual);
-  const expectedList = helpers.listTypeLookup.get(expected);
+  const actualList = context.listTypeLookup.get(actual);
+  const expectedList = context.listTypeLookup.get(expected);
   if (actualList && expectedList) {
-    return isTypeCompatibleWithAuto(actualList, expectedList, helpers, typir);
+    return isTypeCompatibleWithAuto(actualList, expectedList, context);
   }
 
-  const actualRef = helpers.referenceTypeLookup.get(actual);
-  const expectedRef = helpers.referenceTypeLookup.get(expected);
+  const actualRef = context.referenceTypeLookup.get(actual);
+  const expectedRef = context.referenceTypeLookup.get(expected);
   if (actualRef && expectedRef) {
-    return isTypeCompatibleWithAuto(actualRef, expectedRef, helpers, typir);
+    return isTypeCompatibleWithAuto(actualRef, expectedRef, context);
   }
 
   if (isFunctionType(actual) && isFunctionType(expected)) {
@@ -2977,9 +4583,7 @@ function isTypeCompatibleWithAuto(
       const expectedInput = typir.infrastructure.TypeResolver.resolve(
         expectedInputs[index].type
       );
-      if (
-        !isTypeCompatibleWithAuto(actualInput, expectedInput, helpers, typir)
-      ) {
+      if (!isTypeCompatibleWithAuto(actualInput, expectedInput, context)) {
         return false;
       }
     }
@@ -2993,8 +4597,7 @@ function isTypeCompatibleWithAuto(
     return isTypeCompatibleWithAuto(
       typir.infrastructure.TypeResolver.resolve(actualOutput),
       typir.infrastructure.TypeResolver.resolve(expectedOutput),
-      helpers,
-      typir
+      context
     );
   }
 
@@ -3008,6 +4611,7 @@ function getExpectedPatternType(
     typeNat: TypirType;
     typeBool: TypirType;
     typeUnit: TypirType;
+    typeAuto: TypirType;
     tupleTypeLookup: Map<TypirType, TypirType[]>;
     sumTypeLookup: Map<TypirType, [TypirType, TypirType]>;
     recordTypeLookup: Map<TypirType, Map<string, TypirType>>;
@@ -3018,6 +4622,10 @@ function getExpectedPatternType(
 ): TypirType | undefined {
   const binding = AstUtils.getContainerOfType(node, isPatternBinding);
   if (binding) {
+    if (binding.$container?.$type === "LetRec") {
+      return helpers.typeAuto;
+    }
+
     const rhsType = typir.Inference.inferType(binding.rhs);
     if (!Array.isArray(rhsType) && rhsType) {
       return resolveNestedPatternType(binding.pattern, node, rhsType, typir, helpers);
@@ -3061,6 +4669,27 @@ function getExpectedPatternType(
     }
   }
 
+  const tryCastAs = AstUtils.getContainerOfType(
+    node,
+    (candidate): candidate is AstNode & {
+      $type: "TryCastAs";
+      pattern: AstNode;
+      type: AstNode;
+    } => candidate.$type === "TryCastAs"
+  );
+  if (tryCastAs?.pattern) {
+    const castType = typir.Inference.inferType(tryCastAs.type);
+    if (!Array.isArray(castType) && castType) {
+      return resolveNestedPatternType(
+        tryCastAs.pattern,
+        node,
+        castType,
+        typir,
+        helpers
+      );
+    }
+  }
+
   return undefined;
 }
 
@@ -3073,6 +4702,7 @@ function resolveNestedPatternType(
     typeNat: TypirType;
     typeBool: TypirType;
     typeUnit: TypirType;
+    typeAuto: TypirType;
     tupleTypeLookup: Map<TypirType, TypirType[]>;
     sumTypeLookup: Map<TypirType, [TypirType, TypirType]>;
     recordTypeLookup: Map<TypirType, Map<string, TypirType>>;
@@ -3899,24 +5529,33 @@ function validateCatchPattern(
 
 function getExpectedVariantType(
   node: Variant,
-  typir: TypirServices<StellaSpecifics>,
-  variantTypeLookup: Map<TypirType, Map<string, TypirType | undefined>>,
-  referenceTypeLookup: Map<TypirType, TypirType>
+  context: StellaTypeContext
 ): TypirType | undefined {
-  const expected = findExpectedType(node, typir);
-  if (expected && variantTypeLookup.has(expected)) {
+  const typir = context.typir;
+  const expected = findExpectedType(node, context);
+  if (expected && context.variantTypeLookup.has(expected)) {
     return expected;
   }
 
   const container = node.$container as AstNode | undefined;
   if (
+    container?.$type === "Throw" &&
+    (container as { expr?: AstNode }).expr === node
+  ) {
+    const exceptionType = getDeclaredExceptionType(container, typir);
+    if (exceptionType && context.variantTypeLookup.has(exceptionType)) {
+      return exceptionType;
+    }
+  }
+
+  if (
     container?.$type === "Ref" &&
     (container as { expr?: AstNode }).expr === node
   ) {
-    const expectedReference = findExpectedType(container, typir);
+    const expectedReference = findExpectedType(container, context);
     if (expectedReference) {
-      const referencedType = referenceTypeLookup.get(expectedReference);
-      if (referencedType && variantTypeLookup.has(referencedType)) {
+      const referencedType = context.referenceTypeLookup.get(expectedReference);
+      if (referencedType && context.variantTypeLookup.has(referencedType)) {
         return referencedType;
       }
     }
