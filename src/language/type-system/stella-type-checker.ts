@@ -43,7 +43,6 @@ import {
   Variant,
   PatternVariant,
   isMatchCase,
-  // Let,
   PatternInl,
   PatternInr, 
   PatternVar,
@@ -54,7 +53,7 @@ import {
 import { Extensions, getExtensions } from "../extensions.js";
 
 export interface StellaSpecifics extends TypirLangiumSpecifics {
-  AstTypes: StellaAstType; // all AST types from the generated `ast.ts`
+  AstTypes: StellaAstType;
 }
 
 export type TypirStellaServices = TypirLangiumServices<StellaSpecifics>;
@@ -85,13 +84,11 @@ export class StellaTypeSystem
   implements LangiumTypeSystemDefinition<StellaSpecifics>
 {
   onInitialize(typir: TypirStellaServices): void {
-    // Register primitive types
     const typeNat = typir.factory.Primitives.create({
-      // The name here doesn't have to correspond to the name in the grammar, what matters is the inference rule
       primitiveName: "Nat",
     })
       .inferenceRule({ languageKey: ConstInt.$type })
-      .inferenceRule({ languageKey: TypeNat.$type }) // I don't like that "Nat" has type "Nat", but not sure what's it supposed to be
+      .inferenceRule({ languageKey: TypeNat.$type }) 
       .finish();
 
     const typeBool = typir.factory.Primitives.create({
@@ -106,7 +103,7 @@ export class StellaTypeSystem
       .inferenceRule({ languageKey: TypeUnit.$type })
       .finish();
 
-    // TODO: is auto really a "primitive" type? Is there a distinction between primitive and built-in types in Typir?
+  
     const typeAuto = typir.factory.Primitives.create({
       primitiveName: "auto",
     })
@@ -819,17 +816,6 @@ export class StellaTypeSystem
     };
     
 
-    // const pairClass = typir.factory.Classes.create({
-    // className: 'Pair',
-    // fields: [
-    //   { name: 'fst', type: typeAuto }, // плюс другие обязательные поля, если есть
-    //   { name: 'snd', type: typeAuto },
-    // ],
-    // methods: [],
-    // })
-    // .finish();
-
-    // Top and bottom
     const typeTop = typir.factory.Top.create({})
       .inferenceRule({ languageKey: TypeTop.$type })
       .finish();
@@ -861,7 +847,6 @@ export class StellaTypeSystem
     registerAutoCompatibility(typeTop);
     registerAutoCompatibility(typeBottom);
 
-    // Built-in functions
     typir.factory.Functions.create({
       functionName: "succ",
       inputParameters: [{ name: "n", type: typeNat }],
@@ -888,11 +873,9 @@ export class StellaTypeSystem
       inputArguments: (node) => [node.n],
     })
     .finish();
-    // List primitives and operations are handled through cached element-specific types
 
-    // Inference rules
     typir.Inference.addInferenceRulesForAstNodes({
-      Var: (node) => node.ref.ref ?? InferenceRuleNotApplicable, // The type of a variable is the type of the declaration it points to
+      Var: (node) => node.ref.ref ?? InferenceRuleNotApplicable, 
       DeclFunGeneric: (node, typir) => {
         const paramTypes: TypirType[] = [];
         for (const param of node.paramDecls) {
@@ -1620,8 +1603,6 @@ export class StellaTypeSystem
       
     });
 
-    // Additional validations
-    // Return of a function must match the declared return type
     typir.validation.Collector.addValidationRulesForAstNodes({
       DeclFun: (node, accept, typir) => {
         if (!node.returnType) {
@@ -3428,7 +3409,7 @@ export class StellaTypeSystem
         associatedLanguageNode: node,
       })
         .inferenceRuleForDeclaration({
-          matching: (otherNode) => otherNode === node, // only the current function/method declaration matches
+          matching: (otherNode) => otherNode === node, 
         })
         .inferenceRuleForCalls<Application>({
           languageKey: Application.$type,
@@ -4311,7 +4292,6 @@ function getExpectedReferenceType(
   if (!container) return undefined;
 
   while (container) {
-    // Ascription: <0x...> as &T
     if ((container as { $type?: string; expr?: unknown }).$type === "TypeAsc") {
       const typeAsc = container as { type?: unknown; expr?: unknown };
       if (typeAsc.expr === current && typeAsc.type) {
@@ -4322,7 +4302,6 @@ function getExpectedReferenceType(
       }
     }
 
-    // Function return position
     if (
       isDeclFun(container) &&
       container.returnExpr === current &&
@@ -4334,7 +4313,6 @@ function getExpectedReferenceType(
       }
     }
 
-    // Function argument position
     if (container.$type === Application.$type) {
       const application = container as Application;
       const argIndex = application.args.indexOf(current as never);
@@ -5598,7 +5576,7 @@ function validatePatternAgainstSum(
         const expected = sumComponents[1];
         const innerType = typir.Inference.inferType(inner as AstNode);
         if (innerType && !Array.isArray(innerType) && !typir.Equality.getTypeEqualityProblem(innerType, expected)) {
-          // ok
+        
         } else if (innerType && !Array.isArray(innerType)) {
           accept({
             severity: "error",
@@ -5669,7 +5647,6 @@ function validatePatternAgainstVariant(
             !Array.isArray(innerType) &&
             !typir.Equality.getTypeEqualityProblem(innerType, expectedType)
           ) {
-            // ok
           } else if (innerType && !Array.isArray(innerType)) {
             accept({
               severity: "error",
